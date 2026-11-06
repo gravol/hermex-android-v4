@@ -1,0 +1,2986 @@
+package com.hermex.v4.feature.chat
+
+import android.app.Application
+import android.util.Log
+import android.widget.Toast
+import com.hermex.v4.AppState
+import kotlin.runCatching
+import com.hermex.v4.feature.settings.SettingsRepository
+import com.hermex.v4.service.WsKeepaliveService
+import com.hermex.v4.notify.NotificationHelper
+import com.hermex.v4.di.AppModule
+import com.hermex.core.network.DashboardApiClient
+import com.hermex.core.network.NetworkResult
+import androidx.compose.runtime.getValue
+import kotlinx.coroutines.flow.distinctUntilChanged
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.first
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.viewModelScope
+import com.hermex.core.network.DebugLog
+import com.hermex.core.network.JsonRpcClient
+import com.hermex.core.network.JsonRpcException
+import com.hermex.core.network.RpcNotification
+import com.hermex.core.network.WsConnectionManager
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * Dashboard-backed ChatViewModel using JSON-RPC over WebSocket (port 9119).
+ *
+ * Reuses the same UI models ([UiMessage], [UiToolCall], [UiUsage], [ChatUiState])
+ * and the same [mutableStateOf] snapshot-state pattern as the legacy SSE [ChatViewModel].
+ * [ChatScreen] requires no changes — data flows underneath the existing Compose UI.
+ *
+ * SESSION ID LIFECYCLE RULES (Phase 4L.1):
+ * - sessionId (DB key, e.g. "20260717_205748_97c893e8") is persistent and is the
+ *   ONLY value allowed for ALL RPC calls: session.resume, prompt.submit,
+ *   session.interrupt, session.info.
+ * - liveSid (transient live RPC SID, e.g. "0b6c225e") is returned by session.resume
+ *   and is for debug logging ONLY. NEVER assign it to sessionId.
+ * - resumedSessionId stores the "resumed" field from session.resume for logging.
+ */
+class DashboardChatViewModel(application: Application) : ChatViewModelContract(application) {
+
+    // Compose snapshot state — identical pattern to ChatViewModel
+    override var uiState by mutableStateOf(ChatUiState())
+
+    /** v0.5.5: honest connection status for the chat top bar (see ConnectionNotice).
+     *  Snapshot state like uiState — the composable reads it directly. */
+    override var connectionNotice by mutableStateOf<ConnectionNotice?>(null)
+
+    /** The UI calls this after the transient "reconnected" notice has been visible. */
+    override fun clearConnectionNotice() {
+        if (connectionNotice is ConnectionNotice.Restored) connectionNotice = null
+    }
+
+    private var sessionId: String = ""         // stable DB session key — ONLY value for RPC calls
+    private var liveSid: String = ""           // transient live RPC sid — DEBUG ONLY, NEVER used in RPC
+    private var resumedSessionId: String = ""   // "resumed" field from session.resume response
+    private var sessionTitle: String = ""
+    private val tempIdCounter = AtomicInteger(0)
+    private var resumeCount: Int = 0            // how many times session.resume was called
+
+    /** P5 A4: stable per-instance id on every identity/disposition journal line. More
+     *  than one chat ViewModel can be registered for the same session at once; without
+     *  this the journal cannot say WHICH one applied or dropped a frame — which is
+     *  precisely the question the D/14 blank-row mechanism turns on. */
+    private val vmId: Int = System.identityHashCode(this)
+    // Per-VM tally of foreign (wrong-session) notifications per sid, for the FILTERED
+    // log throttle: first delta per foreign sid logs, the rest only bump this counter.
+    private val filteredForeignCounts = mutableMapOf<String, Int>()
+
+    /** FIX 2: the foreground poll loop no longer ends at its first reconcile, so the
+     *  full-history reload it triggers is rate limited instead (at most one per this
+     *  interval per session). The suppressed case is logged, never silent. */
+    private var lastReconcileReloadAtMs: Long = 0L
+    private val reconcileReloadMinIntervalMs: Long = 30_000L
+
+    /**
+     * FIX 5 — does THIS ViewModel have an unanswered prompt of its own making?
+     *
+     * A panel reviewer found the hole that FIX 1 left: rule C used to fire on almost every
+     * first tick, which meant an accidental full reload happened often enough to rescue a
+     * turn that had been lost completely. With C gone, a turn that starts AND finishes
+     * inside a disconnect gap is invisible to A (the stale-stream watchdog clears the
+     * placeholder's spinner), B (we never saw running=true) and D's old gate (no completion
+     * event ever arrived). The app may still know one thing nobody else in that sequence
+     * does: that it submitted the prompt. That is turn knowledge, so rule D accepts it.
+     *
+     * Set when a prompt or slash command is sent from this screen; cleared as soon as the
+     * final row is no longer blank, so a stale flag can never drive a reload loop.
+     */
+    private var localTurnSubmitted = false
+
+    /**
+     * "Reloaded and still blank" — the case earlier reviews said we had no handling for.
+     * Rule D is exempt from the reload cooldown (a blank answer is what the user is
+     * looking at), so without a cap a genuinely missing server-side answer would reload
+     * forever. Three attempts, then it stops and says so in the journal.
+     */
+    private var blankRowReloadsForCurrentTurn = 0
+    private val maxBlankRowReloadsPerTurn = 3
+
+    // v0.1.137 — tracks whether the current turn has been told it is done
+    // server-side (any completion event seen). Lets us clear `isStreaming`
+    // IMMEDIATELY instead of waiting for the stale-stream watchdog, so a
+    // dropped/late/out-of-order completion signal can no longer strand a
+    // spinner on a short "status check" turn forever.
+    // Phase 0 trace: every write to this flag, with the transition. Claude's plan flags
+    // that `if (!turnDoneSeen) turnDoneSeen = false` may be a bug rather than a no-op —
+    // the write log is what settles it, so the flag has to report its own changes.
+    private var _turnDoneSeen = false
+    private var turnDoneSeen: Boolean
+        get() = _turnDoneSeen
+        set(value) {
+            if (_turnDoneSeen != value) {
+                DebugLog.log("TRACE", "turnDoneSeen", "${_turnDoneSeen}→$value (sessionId=$sessionId)")
+            }
+            _turnDoneSeen = value
+        }
+    // v0.1.140: suppress duplicate turn-finished notifications for a single
+    // completed turn. The reconnect reconciliation and the live RunCompleted
+    // path can both fire for the same completion when the WS drops during a
+    // lock; without this you'd get two pings. Cleared when a new turn starts.
+    private var turnNotifPosted = false
+
+    // WebSocket + JSON-RPC infrastructure
+    // v0.1.885: shared app-wide connection. One socket for the whole app — see
+    // AppModule.provideWsConnection for why per-screen managers doubled events.
+    private val wsConnection = AppModule.provideWsConnection()
+    private val rpcClient = AppModule.provideRpcClient()
+    /** Set by /new or /reset — ChatScreen observes it and navigates to the fresh session. */
+    override var resetTargetSession: String? by mutableStateOf(null)
+    private var notificationCollectorJob: Job? = null
+    // v0.1.170: server→client requests (approval/clarify/sudo/…) arrive with a string id
+    // (`srq-<hex>`) and need a JSON-RPC response frame on that id — NOT a notification.
+    // Route them into the same UI state as notifications, but capture the request id so we
+    // can answer via respondRequest(...). Without this every approval/clarify stalls out
+    // the gateway deadline and the agent idles.
+    private var serverRequestCollectorJob: Job? = null
+
+    // ── v0.1.123 stuck-spinner watchdog ──
+    // If a streaming assistant message is still marked isStreaming after this
+    // many ms with no new event, the completion signal was lost → clear it so
+    // the UI doesn't spin forever. Re-armed on every incoming event.
+    private var staleStreamTimeoutJob: Job? = null
+    // Tracks whether ANY streaming content event has arrived for the current
+    // still-streaming message. If we've seen deltas, a long gap is just a
+    // cold-start/agent-warmup pause — NOT a lost completion — so the watchdog
+    // must NOT nuke the stream (see armStaleStreamGuard). Set true on the first
+    // streaming event; reset in ensureStreamingPlaceholder.
+    private var streamingContentSeen = false
+
+    // ── v0.1.81: streaming-delta batching ──
+    // During long thinking/answer runs the server emits coalesced deltas ~30x/sec.
+    // Committing uiState PER DELTA re-renders the streaming bubble 30x/sec — full
+    // message-list copy + full Markdown re-parse of an ever-growing string + scroll
+    // pass — which saturates the main thread (quadratic in message length), heats
+    // the phone, and lags every touch until the app is killed. Buffer deltas and
+    // commit on a fixed ~110ms heartbeat: ~3x fewer full-tree commits, visually
+    // identical (text lands in slightly bigger chunks). Non-delta events flush the
+    // buffer first so wire order is preserved. All of this runs on the Main
+    // dispatcher (the notification collector), so no locking is needed.
+    private val pendingDeltaBuf = StringBuilder()
+    private val pendingThinkBuf = StringBuilder()
+    private var pendingTokPerSec: Float? = null
+    private var deltaFlushJob: Job? = null
+    private val DELTA_FLUSH_MS = 110L
+    private val DELTA_FLUSH_CHAR_CAP = 4096
+    // v0.1.82: aggregate per-batch log counters (flushDeltas emits ONE line)
+    private var pendingContentDeltas = 0
+    private var pendingThinkDeltas = 0
+    // v0.1.137: was 45s (far too slow — a short turn freezes until this fires).
+    // Now ~10s, and it clears immediately if a completion signal was already
+    // seen for the still-streaming message (turnDoneSeen). Primary recovery is
+    // immediate in handleNotification; this is belt-and-suspenders.
+    private val STALE_STREAM_GRACE_MS = 10_000L
+
+    // ─── Debug: timing & state tracking ───
+    private var connectStartTime = 0L
+    private var sessionLoadStartTime = 0L
+
+    // Recovery budget for a reaped/stale session (JSON-RPC 4007 "session no longer
+    // live; retry resume"). After a gateway restart/update the in-memory live
+    // registry is empty and session.resume returns 4007 until the DB row
+    // re-materializes — which can take many seconds. The old budget (2 tries,
+    // ~4.5s total) exhausted before recovery finished, so sendMessage failed with
+    // "session no longer live; retry resume" and the red-panel Retry just emptied
+    // the chat. Exponential backoff capped here gives a generous window without an
+    // absurd wait (usually recovers on the first or second try). Shared by
+    // submitWithSelfHeal (heavy) and loadMessages (lighter via maxAttempts).
+    private val selfHealRetries = 6
+    private val selfHealBaseDelayMs = 3_000L
+    private val selfHealMaxDelayMs = 15_000L
+
+    // ── Public API ──
+
+    /** Initialize with a session. Call once from the composable. */
+    override fun init(sessionId: String, title: String?) {
+        if (this.sessionId == sessionId) {
+            DebugLog.log("STATE", "SessionID",
+                "init() — unchanged sessionId=$sessionId, skipped")
+            return
+        }
+        val oldSid = this.sessionId.takeIf { it.isNotEmpty() } ?: "(none)"
+        this.sessionId = sessionId           // KEEP as stable DB session key — NEVER overwrite with live sid
+        setLiveSid("", "session_key_switch")   // reset until session.resume returns (liveSid is DEBUG ONLY)
+        this.resumedSessionId = ""           // reset until session.resume returns
+        this.resumeCount = 0
+        // Fresh session VM — clear any leftover completion flag from a previous
+        // chat so the first turn's placeholder isn't immediately finalized.
+        this.turnDoneSeen = false
+        // v0.1.140: a new chat/session — allow the next completion to ping again.
+        this.turnNotifPosted = false
+        this.sessionTitle = title ?: sessionId.take(16)
+        uiState = ChatUiState(sessionTitle = this.sessionTitle)
+        // v0.1.874: publish the watched session HERE too. ChatScreen's
+        // DisposableEffect(setScreenVisible) runs synchronously at composition,
+        // i.e. BEFORE LaunchedEffect's coroutine reaches init(), so at that
+        // moment this.sessionId is still "" and visibleSessionId gets "".
+        // init() is where the key actually exists — re-publish if the screen
+        // is already visible.
+        if (screenVisible) {
+            com.hermex.v4.AppState.visibleSessionId = sessionId
+        }
+        // v0.1.886 — a turn that was in flight when the process died: reconcile on
+        // open. loadMessages() does the full reload; clearing turnNotifPosted lets
+        // the completion ping fire for the turn the user never saw.
+        viewModelScope.launch {
+            val mark = inflightStore.getString("inflight_$sessionId").first()
+            if (mark == "1") {
+                turnNotifPosted = false
+                DebugLog.log("STATE", "SessionID",
+                    "in-flight marker for $sessionId — reconciling after process death")
+            }
+        }
+        DebugLog.log("STATE", "SessionID",
+            "init() — sessionId ASSIGNED: old=$oldSid new=$sessionId (DB key) title=$sessionTitle")
+        connectWsAndStart()
+        loadReasoningFromConfig()
+    }
+
+    /**
+     * v0.1.886 — the frozen-spinner gate, widened.
+     *
+     * The old reconcile test looked only at `isStreaming` on an assistant message.
+     * The stale-stream watchdog (v0.1.123) clears that flag after a grace period,
+     * so when it fires first the gate goes false and the full-history reload never
+     * runs — the tool card keeps its live elapsed-timer rendering forever and the
+     * finished answer never surfaces. A tool call that never received its
+     * completion event (`completed == false`) is the same stuck state, so it counts
+     * here too.
+     */
+    private fun localInFlight(): Boolean = uiState.messages.any {
+        it.role == "assistant" && (it.isStreaming || it.toolCalls.any { t -> !t.completed })
+    }
+
+    // v0.1.886 — the app can open a chat MID-TURN. A full `session.resume` returns
+    // the messages the server has persisted so far, and none of them are marked
+    // streaming (server rows are complete), so `localInFlight()` is false and the
+    // reconcile gate never fires: the chat stops mid-answer with no spinner and no
+    // way to learn the turn finished. Remember that we attached while running, and
+    // reload when the poll sees it stop.
+    private var serverTurnWasRunning = false
+
+    /** Phase 0 trace: counts poll loops so the log can show how many are alive. */
+    private val pollLoopCounter = java.util.concurrent.atomic.AtomicInteger(0)
+
+    // v0.1.886 — persisted in-flight marker. Android kills backgrounded app
+    // processes, and the chat ViewModel dies with them, so no reconcile code can
+    // run after a process death: the user's only recovery is close + reopen. The
+    // marker records "a turn was running for this session" across process death,
+    // so the next chat open reconciles (full reload) and the turn-finished ping
+    // fires. Cleared when the server reports the turn is not running, and on every
+    // completion signal.
+    private val inflightStore by lazy {
+        com.hermex.v4.di.AppModule.provideDataStoreManager(getApplication())
+    }
+
+    private fun markInFlight(sid: String) {
+        if (sid.isEmpty()) return
+        viewModelScope.launch { runCatching { inflightStore.setString("inflight_$sid", "1") } }
+    }
+
+    private fun clearInFlight(sid: String) {
+        if (sid.isEmpty()) return
+        viewModelScope.launch { runCatching { inflightStore.setString("inflight_$sid", "") } }
+    }
+
+    override fun loadMessages() {
+        if (sessionId.isEmpty()) return
+        val callNum = resumeCount + 1
+        DebugLog.log("STATE", "SessionID",
+            "loadMessages(#$callNum) — entering with sessionId=$sessionId")
+        viewModelScope.launch {
+            uiState = uiState.copy(isLoading = true, error = null)
+            try {
+                val result = rpcClient.sessionResume(sessionId)
+                resumeCount++
+                if (result.running == false) clearInFlight(sessionId)
+                // liveSid is DEBUG ONLY — never write into sessionId
+                val newLiveSid = result.session_id
+                val newResumed = result.resumed ?: sessionId
+                val newSessionKey = result.session_key
+
+                DebugLog.log("STATE", "SessionID",
+                    "loadMessages(#${resumeCount}) RESULT: " +
+                    "input_sessionId=$sessionId " +
+                    "result.session_id=$newLiveSid " +
+                    "result.resumed=$newResumed " +
+                    "result.session_key=$newSessionKey " +
+                    "result.message_count=${result.message_count}")
+
+                setLiveSid(newLiveSid, "loadMessages_resume#$resumeCount")  // DEBUG ONLY — see Phase 4L.1 rule
+                resumedSessionId = newResumed   // for logging/reference
+
+                DebugLog.log("STATE", "SessionID",
+                    "loadMessages(#${resumeCount}) ASSIGNMENTS: " +
+                    "liveSid=$liveSid (debug only) " +
+                    "resumedSessionId=$resumedSessionId " +
+                    "sessionId UNCHANGED=$sessionId (DB key preserved)")
+
+                if (newSessionKey != null && newSessionKey != sessionId) {
+                    DebugLog.log("STATE", "SessionID",
+                        "loadMessages(#${resumeCount}) WARNING: " +
+                        "session_key=$newSessionKey differs from dbKey=$sessionId")
+                }
+
+                // v0.1.73: history stores tool activity as SEPARATE role="tool"
+                // rows ({name, context}) and assistant thinking in `reasoning`.
+                // Merge tool rows into the preceding assistant message's tool
+                // box instead of rendering them as jumbled standalone bubbles;
+                // carry reasoning into the thinking box.
+                val messages = result.messages?.let { raw ->
+                    val out = mutableListOf<UiMessage>()
+                    for (it in raw) {
+                        val role = it.role ?: "user"
+                        if (role == "tool") {
+                            val prev = out.lastOrNull()
+                            if (prev != null && prev.role == "assistant") {
+                                val idx = out.size - 1
+                                // v0.8.1: merge by tool-call id — the assistant
+                                // row already contributed the Input (args); this
+                                // row contributes the Output. One row per call,
+                                // detail sheet shows both like the official app.
+                                val matchIdx = prev.toolCalls.indexOfFirst { tc -> it.id != null && tc.id == it.id }
+                                val merged = if (matchIdx >= 0) {
+                                    prev.toolCalls.toMutableList().also { m ->
+                                        m[matchIdx] = m[matchIdx].copy(
+                                            preview = it.context ?: m[matchIdx].preview,
+                                            result = it.context ?: m[matchIdx].result,
+                                            completed = true,
+                                        )
+                                    }
+                                } else {
+                                    prev.toolCalls + UiToolCall(
+                                        id = it.id ?: "tc_${tempIdCounter.incrementAndGet()}",
+                                        toolName = it.name ?: "tool",
+                                        preview = it.context,
+                                        result = it.context,
+                                        completed = true,
+                                    )
+                                }
+                                out[idx] = prev.copy(toolCalls = merged)
+                            }
+                            continue
+                        }
+                        val thinking = it.resolvedThinking
+                        out.add(
+                            UiMessage(
+                                id = it.id ?: "msg_${tempIdCounter.incrementAndGet()}",
+                                role = role,
+                                content = it.resolvedContent ?: "",
+                                thinkingExpanded = false,
+                                thinkingText = thinking,
+                                thinkingHasContent = !thinking.isNullOrBlank(),
+                                toolCalls = it.tool_calls?.map { tc ->
+                                    UiToolCall(
+                                        id = tc.id ?: "tc",
+                                        toolName = tc.function?.name ?: "unknown",
+                                        args = tc.function?.arguments,
+                                        completed = true,
+                                    )
+                                } ?: emptyList(),
+                                timestamp = System.currentTimeMillis(),
+                            )
+                        )
+                    }
+                    out
+                } ?: emptyList()
+                val context = parseContextUsage(result.info)
+                // Replay the task list: the last todo tool result in history is
+                // the authoritative state (same source the desktop Tasks panel uses).
+                val todos = result.messages
+                    ?.filter { it.role == "tool" && it.name == "todo" }
+                    ?.lastOrNull()
+                    ?.let { parseTodosFromString(it.context) }
+                uiState = uiState.copy(
+                    isLoading = false,
+                    isStreaming = false,
+                    messages = messages,
+                    error = null,
+                    contextUsed = context.first,
+                    contextMax = context.second,
+                    // v0.1.88: current model from the resume payload
+                    currentModel = (result.info?.get("model") as? JsonObject)?.get("id")
+                        ?.jsonPrimitive?.contentOrNull
+                        ?: result.info?.get("model")?.jsonPrimitive?.contentOrNull
+                        ?: uiState.currentModel,
+                    // v0.1.91: reasoning_effort comes straight from session.info
+                    // (authoritative per-session) — fall back to the saved pick.
+                    currentReasoning = result.info?.get("reasoning_effort")
+                        ?.jsonPrimitive?.contentOrNull
+                        ?.takeIf { it.isNotBlank() }
+                        ?: uiState.currentReasoning,
+                    todos = todos.orEmpty(),
+                )
+                val loadDuration = if (sessionLoadStartTime > 0) System.currentTimeMillis() - sessionLoadStartTime else -1L
+                DebugLog.log("RPC", "DashboardChat",
+                    "session.resume → ${messages.size} messages in ${loadDuration}ms" +
+                    " (message_count=${result.message_count})")
+                sessionLoadStartTime = 0L
+
+                // v0.1.138: turn finished while disconnected. When the phone locks
+                // or Hermex is closed, the WS dies and the completion event never
+                // reaches us — but the turn keeps running server-side and this
+                // resume fetches the final answer (which is why it renders on return).
+                // Detect that case here: if the server says the turn is done AND we
+                // weren't watching, fire the turn-finished notification so you actually
+                // get pinged. Without this, completed-while-away turns are silent.
+                val lastAssistant = messages.lastOrNull { it.role == "assistant" }
+                val turnDoneServerSide = result.running == false
+                if (turnDoneServerSide && lastAssistant != null && !screenVisible) {
+                    val preview = lastAssistant.content.ifBlank { "Turn finished" }.take(200)
+                    DebugLog.log("NOTIF", "DashboardChat",
+                        "loadMessages: turn finished while away — posting turn-finished notification")
+                    runCatching {
+                        NotificationHelper.postTurnFinished(
+                            getApplication(), sessionId, uiState.sessionTitle, preview,
+                        )
+                    }
+                }
+            } catch (e: JsonRpcException) {
+                if (e.code == 4007) {
+                    // v0.1.89: 4007 = session not found. For a JUST-CREATED
+                    // session that's NORMAL — the server only flushes the DB
+                    // row on the first run, so resume can't find it yet. Show
+                    // an empty chat; the first prompt.submit attaches the agent
+                    // and persists (verified server-side). Also covers deleted
+                    // sessions (nothing to show anyway). BUT a reaped/restarting
+                    // session also 4007s until its DB row re-materializes, so we
+                    // retry resume with capped backoff before giving up — if it
+                    // recovers we load the real history instead of an empty chat.
+                    DebugLog.log("RPC", "DashboardChat",
+                        "loadMessages 4007 (fresh/reaped session) — backing off then retrying: $sessionId")
+                    val recovered = resumeUntilLive(3, selfHealBaseDelayMs, selfHealMaxDelayMs)
+                    if (recovered != null) {
+                        resumeCount++
+                        setLiveSid(recovered.session_id, "loadMessages_4007_selfheal")
+                        resumedSessionId = recovered.resumed ?: sessionId
+                        DebugLog.log("RPC", "DashboardChat",
+                            "loadMessages 4007 recovered — reloading with fresh result: $sessionId")
+                        loadMessages()  // retry with the recovered session
+                    }
+                    DebugLog.log("RPC", "DashboardChat",
+                        "loadMessages 4007 (fresh/deleted session) — starting empty: $sessionId")
+                    uiState = uiState.copy(isLoading = false, messages = emptyList(), error = null)
+                } else if (e.code == 4001) {
+                    // v0.1.169: 4001 = session REAPED by the gateway (ws_orphan_reap /
+                    // idle_timeout / lru_evict). The live socket was orphaned and the
+                    // in-memory registry dropped it, so session.resume can't find it.
+                    // submitWithSelfHeal already self-heals 4001 on prompt.submit, but
+                    // loadMessages did not — opening a reaped session just showed an error
+                    // and died instead of recovering. Force a fresh connection first (a
+                    // silent Tailscale drop can leave the WS unusable while the app still
+                    // thinks it's connected), then resume with backoff so the DB row
+                    // re-materializes and we load real history instead of an empty chat.
+                    DebugLog.log("RPC", "DashboardChat",
+                        "loadMessages 4001 (reaped session) — forceConnect then retrying: $sessionId")
+                    if (!wsConnection.isConnected) {
+                        wsConnection.forceConnect()
+                    }
+                    // resumeUntilLive only retries on 4007 and rethrows anything else
+                    // (incl. a persistent 4001). Wrap it so a lingering 4001 can't escape
+                    // this catch block and crash loadMessages — just start empty instead.
+                    val recovered = runCatching {
+                        resumeUntilLive(3, selfHealBaseDelayMs, selfHealMaxDelayMs)
+                    }.getOrNull()
+                    if (recovered != null) {
+                        resumeCount++
+                        setLiveSid(recovered.session_id, "loadMessages_4001_selfheal")
+                        resumedSessionId = recovered.resumed ?: sessionId
+                        DebugLog.log("RPC", "DashboardChat",
+                            "loadMessages 4001 recovered — reloading with fresh result: $sessionId")
+                        loadMessages()  // retry with the recovered session
+                    } else {
+                        DebugLog.log("RPC", "DashboardChat",
+                            "loadMessages 4001 exhausted — starting empty: $sessionId")
+                        uiState = uiState.copy(isLoading = false, messages = emptyList(), error = null)
+                    }
+                } else {
+                    Log.e("Hermex", "DashboardChatViewModel: loadMessages failed", e)
+                    uiState = uiState.copy(
+                        isLoading = false,
+                        error = e.message ?: "Failed to load messages",
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e("Hermex", "DashboardChatViewModel: loadMessages failed", e)
+                uiState = uiState.copy(
+                    isLoading = false,
+                    error = e.message ?: "Failed to load messages",
+                )
+            }
+        }
+    }
+
+    /**
+     * Submit a prompt, self-healing a reaped/stale session.
+     *
+     * The dashboard reaps live sessions whose WebSocket went orphaned
+     * (ws_orphan_reap / idle_timeout / lru_evict) and the client gets no
+     * signal — the next prompt.submit then fails with JSON-RPC 4001
+     * "session not found". On 4001 we re-register via session.resume
+     * (which re-materializes the session from the DB) and retry once.
+     * If session.resume also returns 4007 (fresh/deleted/reaping session),
+     * [resumeUntilLive] retries with exponential backoff until the DB row
+     * re-materializes or the budget is exhausted, then falls back to sending
+     * directly (the genuinely-fresh-session path, where the server creates the
+     * row on first turn). Any other error propagates to the caller.
+     */
+    /**
+     * v0.1.83: attach calls (file/image) have NO self-heal of their own — on a
+     * reaped session (4001) they just surface "session not found" and the send
+     * dies. Recover the exact way submitWithSelfHeal does (force a live socket
+     * if needed, session.resume with 4007 backoff) and report whether the
+     * caller should retry the attach. Non-4001 errors return false (caller
+     * shows the real error).
+     */
+    private suspend fun healReapedSessionForAttach(op: String): Boolean = try {
+        if (!wsConnection.isConnected) {
+            DebugLog.log("STATE", "SessionID",
+                "$op 4001 — socket not Connected, forceConnect() before resume: dbKey=$sessionId")
+            wsConnection.forceConnect()
+        }
+        val result = try {
+            rpcClient.sessionResume(sessionId)
+        } catch (resume4007: JsonRpcException) {
+            if (resume4007.code == 4007) resumeUntilLive(selfHealRetries, selfHealBaseDelayMs, selfHealMaxDelayMs)
+            else throw resume4007
+        }
+        if (result != null) {
+            resumeCount++
+            setLiveSid(result.session_id, "selfheal_resume_$op")
+            resumedSessionId = result.resumed ?: sessionId
+            DebugLog.log("STATE", "SessionID",
+                "$op self-heal resume(#$resumeCount): dbKey=$sessionId liveSid=$liveSid — retrying attach")
+            true
+        } else {
+            // v0.1.85: the "retry attach bare" fallback was a lie — file.attach is a
+            // pure runtime lookup server-side (_sess_nowait); it NEVER materializes a
+            // session. A fresh chat has no DB row (only prompt.submit/session.create
+            // make one), so resume 4007s and the bare retry 4001s forever.
+            // Materialize it FOR REAL: session.create, adopt the new DB key, retry.
+            DebugLog.log("STATE", "SessionID",
+                "$op self-heal resume exhausted 4007 (no stored row) — session.create + adopt key: dbKey=$sessionId")
+            // v0.1.901: adopt the DURABLE key, not the live sid — this value becomes
+            // this ViewModel's sessionId, which everything downstream (resume, notify,
+            // deep link) is keyed on. createSession() returned the live sid, so an
+            // adopted "new DB key" was actually a ~20-second routing handle.
+            val newKey = runCatching { rpcClient.createSessionWithKey().second ?: rpcClient.createSessionWithKey().first }.getOrNull()
+            if (newKey != null) {
+                DebugLog.log("STATE", "SessionID",
+                    "$op self-heal created fresh session: old=$sessionId new=$newKey — retrying attach")
+                sessionId = newKey
+                setLiveSid("", "session_created_new_db_key")
+                resumedSessionId = ""
+                resumeCount = 0
+                true
+            } else {
+                DebugLog.log("STATE", "SessionID",
+                    "$op self-heal session.create FAILED — attach cannot proceed: dbKey=$sessionId")
+                false
+            }
+        }
+    } catch (healErr: Exception) {
+        DebugLog.log("STATE", "SessionID",
+            "$op self-heal failed: ${healErr.message}")
+        false
+    }
+
+    private suspend fun submitWithSelfHeal(text: String) {
+        try {
+            rpcClient.promptSubmit(sessionId, text)
+        } catch (e: JsonRpcException) {
+            if (e.code != 4001) throw e
+            DebugLog.log("STATE", "SessionID",
+                "prompt.submit 4001 (session reaped) — ensuring live socket before resume: dbKey=$sessionId")
+            // The socket may be dead or mid-reconnect (a silent Tailscale drop leaves the WS
+            // unusable while the app still thinks it's connected). session.resume over a dead
+            // socket can't complete, so self-heal loops forever without recovering. Force a fresh
+            // connection first so resume has a working transport to re-attach the live session to.
+            if (!wsConnection.isConnected) {
+                DebugLog.log("STATE", "SessionID",
+                    "self-heal — socket not Connected, forceConnect() before resume: dbKey=$sessionId")
+                wsConnection.forceConnect()
+            }
+            val result = try {
+                rpcClient.sessionResume(sessionId)
+            } catch (resume4007: JsonRpcException) {
+                if (resume4007.code == 4007) {
+                    DebugLog.log("STATE", "SessionID",
+                        "self-heal resume 4007 (fresh/reaped) — backing off then retrying: dbKey=$sessionId")
+                    // Generational backoff so a post-restart reap window (DB row
+                    // still materializing) can recover instead of failing fast.
+                    val recovered = resumeUntilLive(selfHealRetries, selfHealBaseDelayMs, selfHealMaxDelayMs)
+                    recovered
+                } else {
+                    throw resume4007
+                }
+            }
+            if (result != null) {
+                resumeCount++
+                setLiveSid(result.session_id, "submit_selfheal_resume")  // debug only — never write into sessionId
+                resumedSessionId = result.resumed ?: sessionId
+                DebugLog.log("STATE", "SessionID",
+                    "self-heal resume(#$resumeCount): dbKey=$sessionId liveSid=$liveSid — retrying submit")
+                rpcClient.promptSubmit(sessionId, text)
+            } else {
+                // Fresh session — server will create the DB row on first turn
+                DebugLog.log("STATE", "SessionID",
+                    "self-heal resume exhausted 4007 after backoff — sending prompt.submit directly: dbKey=$sessionId")
+                rpcClient.promptSubmit(sessionId, text)
+            }
+        }
+    }
+
+    /**
+     * Retry session.resume with capped exponential backoff until it succeeds or
+     * the retry budget is exhausted. Returns the successful resume result, or
+     * null if every attempt still 4007'd (caller then falls back to sending a
+     * prompt directly, which materializes a fresh session on first turn). A
+     * non-4007 error propagates immediately — it's not a reaping condition.
+     */
+    private suspend fun resumeUntilLive(
+        maxAttempts: Int,
+        baseDelayMs: Long,
+        maxDelayMs: Long,
+    ): JsonRpcClient.SessionResumeResult? {
+        var recovered: JsonRpcClient.SessionResumeResult? = null
+        repeat(maxAttempts) { attempt ->
+            try {
+                val delayMs = (baseDelayMs * (attempt + 1)).coerceAtMost(maxDelayMs)
+                DebugLog.log("STATE", "SessionID",
+                    "resumeUntilLive attempt ${attempt + 1}/$maxAttempts — waiting ${delayMs}ms before retry: dbKey=$sessionId")
+                delay(delayMs)
+                recovered = rpcClient.sessionResume(sessionId)
+                if (recovered != null) {
+                    DebugLog.log("STATE", "SessionID",
+                        "resumeUntilLive succeeded on attempt ${attempt + 1}: dbKey=$sessionId liveSid=${recovered.session_id}")
+                    return@repeat
+                }
+            } catch (retry4007: JsonRpcException) {
+                if (retry4007.code != 4007) throw retry4007
+                DebugLog.log("STATE", "SessionID",
+                    "resumeUntilLive attempt ${attempt + 1}/$maxAttempts still 4007 — dbKey=$sessionId")
+            }
+        }
+        return recovered
+    }
+
+    // ── v0.8.0: client-side cancellable message queue ──
+    // A message held here has NOT been sent: the ✕ on its chip is a true
+    // cancel. The gateway's own busy-queue (server auto-queue) has no cancel
+    // RPC, which is exactly why this path exists client-side.
+    private var queueDrainerStarted = false
+
+    override fun queueMessage(text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isBlank() || sessionId.isEmpty()) return
+        // Idle (or /stop-style command): nothing to wait for — send now.
+        if (!uiState.isStreaming) {
+            sendMessage(trimmed)
+            return
+        }
+        uiState = uiState.copy(queuedMessages = uiState.queuedMessages + trimmed)
+        startQueueDrainer()
+    }
+
+    override fun cancelQueued(index: Int) {
+        val q = uiState.queuedMessages
+        if (index in q.indices) {
+            uiState = uiState.copy(queuedMessages = q.filterIndexed { i, _ -> i != index })
+        }
+    }
+
+    private fun startQueueDrainer() {
+        if (queueDrainerStarted) return
+        queueDrainerStarted = true
+        viewModelScope.launch {
+            var wasStreaming = true
+            snapshotFlow { uiState.isStreaming }
+                .distinctUntilChanged()
+                .collect { streaming ->
+                    // true → false edge: drain ONE queued message (FIFO). The
+                    // next turn-end picks up the rest via the same edge.
+                    if (wasStreaming && !streaming) {
+                        val q = uiState.queuedMessages
+                        if (q.isNotEmpty()) {
+                            uiState = uiState.copy(queuedMessages = q.drop(1))
+                            sendMessage(q.first())
+                        }
+                    }
+                    wasStreaming = streaming
+                }
+        }
+    }
+
+    override fun sendMessage(text: String) {
+        if (text.isBlank() || sessionId.isEmpty()) return
+        val trimmed = text.trim()
+        markInFlight(sessionId)
+
+        // /stop / /interrupt / /halt: end the turn via session.interrupt — NOT
+        // slash.exec (the server's /stop kills background processes, it does not
+        // interrupt the live turn).
+        if (trimmed == "/stop" || trimmed == "/interrupt" || trimmed == "/halt") {
+            stopStreaming()
+            return
+        }
+
+        // /steer — native session.steer with an in-chat ack (v0.1.130).
+        if (trimmed.startsWith("/steer ") || trimmed == "/steer") {
+            handleSteer(trimmed.removePrefix("/steer").trim())
+            return
+        }
+        // /queue — native prompt.submit (server auto-queues when busy) with ack (v0.1.131).
+        if (trimmed.startsWith("/queue ") || trimmed == "/queue") {
+            handleQueue(trimmed.removePrefix("/queue").trim())
+            return
+        }
+        // /new and /reset — native fresh session via session.create (v0.1.130);
+        // bypasses slash.exec entirely (the slash-worker 5030 flakiness).
+        if (trimmed.equals("/new", ignoreCase = true) || trimmed.equals("/reset", ignoreCase = true) ||
+            trimmed.startsWith("/new ") || trimmed.startsWith("/reset ")
+        ) {
+            handleNewSession()
+            return
+        }
+        // Slash commands (v0.1.67): messages starting with "/" route to
+        // slash.exec (same path as desktop/TUI) instead of the agent. The
+        // output lands as an assistant message.
+        if (trimmed.startsWith("/") && trimmed.length > 1 && !trimmed.startsWith("//")) {
+            sendSlashCommand(trimmed)
+            return
+        }
+
+        submitPrompt(trimmed)
+    }
+
+    /**
+     * Submit a normal (non-slash) prompt. While a turn is already streaming the
+     * server auto-queues it for the next turn (prompt.submit busy path), so we
+     * add the user message but no second streaming placeholder — the queued
+     * turn's first event creates one via [ensureStreamingPlaceholder].
+     */
+    private fun submitPrompt(text: String) {
+        val userMsgId = "user_${tempIdCounter.incrementAndGet()}"
+        val assistantMsgId = "asst_${tempIdCounter.incrementAndGet()}"
+        val now = System.currentTimeMillis()
+
+        DebugLog.log("STATE", "SessionID",
+            "sendMessage ENTER: text=\"${text.take(50)}\" " +
+            "sessionId=$sessionId (DB key) liveSid=$liveSid (debug) " +
+            "resumedSessionId=$resumedSessionId " +
+            "resumeCount=${resumeCount}")
+
+        // Add user message immediately
+        val userMsg = UiMessage(id = userMsgId, role = "user", content = text, timestamp = now)
+        val current = uiState.messages.toMutableList()
+        current.add(userMsg)
+
+        // A fresh turn starts here — clear any leftover completion flag from a
+        // previous turn so the new placeholder isn't immediately finalized.
+        this.turnDoneSeen = false
+        // FIX 5: this screen asked the question, so rule D has turn knowledge even if no
+        // running=true and no completion event ever reaches us (turn lost inside a gap).
+        this.localTurnSubmitted = true
+        this.blankRowReloadsForCurrentTurn = 0
+        // v0.1.140: a new turn — allow the next completion to ping again.
+        this.turnNotifPosted = false
+
+        // Add an empty streaming placeholder only when this is the active turn
+        // (not a queued prompt sent mid-turn — that one gets its placeholder
+        // lazily when its deltas start arriving).
+        if (!uiState.isStreaming) {
+            val asstMsg = UiMessage(
+                id = assistantMsgId, role = "assistant",
+                isStreaming = true, isWaitingForFirstEvent = true, timestamp = now,
+            )
+            current.add(asstMsg)
+        }
+
+        uiState = uiState.copy(
+            messages = current,
+            isStreaming = true,
+            error = null,
+        )
+
+        viewModelScope.launch {
+            try {
+                DebugLog.log("STATE", "SessionID",
+                    "prompt.submit CALL: sessionId=$sessionId (DB key) " +
+                    "liveSid=$liveSid (debug only) " +
+                    "resumeCount=$resumeCount")
+                DebugLog.log("RPC", "DashboardChat",
+                    "prompt.submit → dbKey=$sessionId liveSid=$liveSid text=\"${text.take(50)}\"")
+                submitWithSelfHeal(text)
+                DebugLog.log("STATE", "SessionID",
+                    "prompt.submit OK: sessionId=$sessionId")
+            } catch (e: Exception) {
+                Log.e("Hermex", "DashboardChatViewModel: promptSubmit failed", e)
+                DebugLog.log("STATE", "SessionID",
+                    "prompt.submit FAILED: sessionId=$sessionId error=${e.message}")
+                val msgs = uiState.messages.toMutableList()
+                val idx = msgs.indexOfLast { it.role == "assistant" && it.isStreaming }
+                if (idx >= 0) {
+                    msgs[idx] = msgs[idx].copy(isStreaming = false)
+                }
+                uiState = uiState.copy(
+                    messages = msgs,
+                    isStreaming = false,
+                    error = e.message ?: "Send failed",
+                )
+            }
+        }
+    }
+
+    /** Execute a slash command via slash.exec and surface its output. */
+    private fun sendSlashCommand(command: String) {
+        val userMsgId = "user_${tempIdCounter.incrementAndGet()}"
+        val asstMsgId = "asst_${tempIdCounter.incrementAndGet()}"
+        val now = System.currentTimeMillis()
+        val userMsg = UiMessage(id = userMsgId, role = "user", content = command, timestamp = now)
+        // Placeholder with spinner: slash commands (e.g. /compress) can take
+        // minutes with no stream events — the user needs to see it working.
+        // A slash command is a fresh turn; clear any leftover completion flag.
+        this.turnDoneSeen = false
+        // FIX 5: same as the prompt path — this screen asked, so rule D knows a turn ran.
+        this.localTurnSubmitted = true
+        this.blankRowReloadsForCurrentTurn = 0
+        // v0.1.140: a new turn — allow the next completion to ping again.
+        this.turnNotifPosted = false
+        val asstMsg = UiMessage(
+            id = asstMsgId, role = "assistant",
+            isStreaming = true, isWaitingForFirstEvent = true, timestamp = now,
+        )
+        val current = uiState.messages.toMutableList()
+        current.add(userMsg)
+        current.add(asstMsg)
+        uiState = uiState.copy(messages = current, error = null)
+        viewModelScope.launch {
+            try {
+                val result = execSlashWithFallbacks(command)
+                applySlashResult(result, command)
+                // Slash commands can change context (e.g. /compress) — refresh gauge
+                try {
+                    val res = rpcClient.sessionResume(sessionId, omitMessages = true)
+                    val ctx = parseContextUsage(res.info)
+                    if (ctx.first != null || ctx.second != null) {
+                        uiState = uiState.copy(
+                            contextUsed = ctx.first ?: uiState.contextUsed,
+                            contextMax = ctx.second ?: uiState.contextMax,
+                        )
+                    }
+                } catch (_: Exception) { }
+            } catch (e: Exception) {
+                Log.e("Hermex", "slash.exec failed", e)
+                val msgs = uiState.messages.toMutableList()
+                val idx = msgs.indexOfLast { it.role == "assistant" && it.isStreaming }
+                val errText = "⚠️ Command failed: ${e.message}"
+                if (idx >= 0) {
+                    msgs[idx] = msgs[idx].copy(content = errText, isStreaming = false)
+                } else {
+                    msgs.add(
+                        UiMessage(
+                            id = "slash_err_${tempIdCounter.incrementAndGet()}",
+                            role = "assistant",
+                            content = errText,
+                            timestamp = System.currentTimeMillis(),
+                        )
+                    )
+                }
+                uiState = uiState.copy(messages = msgs)
+            }
+        }
+    }
+
+    /**
+     * v0.1.99: run slash.exec with two server-side fallbacks:
+     *  1. Skill/bundle commands are rejected by slash.exec with 4018
+     *     "use command.dispatch" — route them through command.dispatch, which
+     *     resolves `_sessions` by LIVE SID only (pass liveSid, not the DB key).
+     *  2. 4001 session not found — the session was reaped; re-register it with
+     *     session.resume and retry once (same self-heal as prompt.submit).
+     */
+    private suspend fun execSlashWithFallbacks(command: String): JsonObject {
+        // v0.1.901: these RPCs resolve `_sessions` by LIVE SID only, so with liveSid
+        // blank the call used to send the DB key and deterministically 4001, then our
+        // own 4001 handler resumed and retried — a wasted round trip that could surface
+        // as a visible command failure. Resume first, then ask.
+        if (liveSid.isBlank()) {
+            try {
+                val preflight = rpcClient.sessionResume(sessionId, omitMessages = true)
+                setLiveSid(preflight.session_id, "slash_exec_preflight_resume")
+                resumedSessionId = preflight.resumed ?: sessionId
+                DebugLog.log("STATE", "SessionID",
+                    "slash.exec preflight: no live sid — resumed before calling (dbKey=$sessionId liveSid=$liveSid)")
+            } catch (e: Exception) {
+                DebugLog.log("ERROR", "SessionID",
+                    "slash.exec preflight resume FAILED (dbKey=$sessionId): ${e.message} — attempting anyway")
+            }
+        }
+        return try {
+            // slash.exec resolves _sessions by LIVE SID only (no DB-key fallback —
+            // proven live: a persisted DB key 4001s while the live SID works), so
+            // pass the live SID when we have it, same rule as command.dispatch.
+            rpcClient.slashExec(liveSid.ifBlank { sessionId }, command)
+        } catch (e: JsonRpcException) {
+            when {
+                // v0.1.159: slash.exec routes through a server-side slash-worker
+                // subprocess that can crash ("slash worker exited" / 5030). The
+                // command itself is fine — only the worker transport died. Fall
+                // back to command.dispatch, which runs these commands in-process
+                // (e.g. _handle_yolo_command) and never touches the dead worker.
+                e.code == 5030 || e.message?.contains("slash worker") == true -> {
+                    val trimmed = command.trim().removePrefix("/")
+                    val base = trimmed.substringBefore(' ').lowercase()
+                    val arg = trimmed.substringAfter(' ', "").trim()
+                    DebugLog.log("RPC", "DashboardChat",
+                        "slash.exec slash-worker error → command.dispatch name=$base arg=$arg (liveSid=$liveSid)")
+                    rpcClient.commandDispatch(liveSid.ifBlank { sessionId }, base, arg)
+                }
+                e.code == 4018 && e.message?.contains("command.dispatch") == true -> {
+                    val trimmed = command.trim().removePrefix("/")
+                    val base = trimmed.substringBefore(' ').lowercase()
+                    val arg = trimmed.substringAfter(' ', "").trim()
+                    DebugLog.log("RPC", "DashboardChat",
+                        "slash.exec 4018 → command.dispatch name=$base arg=$arg (liveSid=$liveSid)")
+                    rpcClient.commandDispatch(liveSid.ifBlank { sessionId }, base, arg)
+                }
+                e.code == 4001 -> {
+                    DebugLog.log("STATE", "SessionID",
+                        "slash.exec 4001 — self-heal resume + retry (dbKey=$sessionId)")
+                    val resume = rpcClient.sessionResume(sessionId, omitMessages = true)
+                    setLiveSid(resume.session_id, "slash_exec_4001_resume")
+                    resumedSessionId = resume.resumed ?: sessionId
+                    rpcClient.slashExec(liveSid.ifBlank { sessionId }, command)
+                }
+                else -> throw e
+            }
+        }
+    }
+
+    /**
+     * Apply a slash.exec / command.dispatch result to the placeholder:
+     *  - {"type":"send"|"skill","message":...} → submit the message as a real
+     *    prompt (the server wants a turn: /queue, /steer, skill invocations)
+     *  - {"output":...} → render as the assistant message
+     *  - anything else → render the raw JSON (debuggable)
+     */
+    private fun applySlashResult(result: JsonObject, command: String) {
+        val sendType = result["type"]?.jsonPrimitive?.contentOrNull
+        val sendMsg = result["message"]?.jsonPrimitive?.contentOrNull
+        if ((sendType == "send" || sendType == "skill") && sendMsg != null) {
+            val msgs = uiState.messages.toMutableList()
+            val phIdx = msgs.indexOfLast { it.role == "assistant" && it.isStreaming }
+            if (phIdx >= 0) msgs.removeAt(phIdx)
+            val cmdIdx = msgs.indexOfLast { it.role == "user" && it.content == command }
+            if (cmdIdx >= 0) msgs.removeAt(cmdIdx)
+            uiState = uiState.copy(messages = msgs)  // keep isStreaming as-is
+            submitPrompt(sendMsg)
+            return
+        }
+        val output = result["output"]?.jsonPrimitive?.contentOrNull
+            ?: result.toString()
+        val msgs = uiState.messages.toMutableList()
+        val idx = msgs.indexOfLast { it.role == "assistant" && it.isStreaming }
+        if (idx >= 0) {
+            msgs[idx] = msgs[idx].copy(content = output, isStreaming = false)
+        } else {
+            msgs.add(
+                UiMessage(
+                    id = "slash_${tempIdCounter.incrementAndGet()}",
+                    role = "assistant",
+                    content = output,
+                    timestamp = System.currentTimeMillis(),
+                )
+            )
+        }
+        uiState = uiState.copy(messages = msgs)
+    }
+
+    /** /steer <text> — inject into the live turn via session.steer. */
+    private fun handleSteer(text: String) {
+        if (text.isBlank()) {
+            addCommandAck("⚠️ /steer needs some text to steer with.")
+            return
+        }
+        // v0.1.901: rewritten against the actual server contract
+        // (`tui_gateway/methods_session_interrupt.py::_correction_method`), because
+        // "/steer doesn't steer" was true in the common case:
+        //  * An IDLE session answers {"status":"rejected"} BY DESIGN — the documented
+        //    client behaviour is then to send the text as a normal prompt ("'rejected'
+        //    makes the client queue it as a normal next prompt"). We warned and DROPPED
+        //    the user's words instead.
+        //  * 4010 means this agent has no steer capability at all. The old ack claimed
+        //    "Steer queued — no active turn; it'll apply on your next message", which
+        //    was never true: nothing had been queued.
+        //  * A mid-turn steer is delivered as a new user row after the newest tool
+        //    result (`agent_runtime_helpers`), and when the turn produces no further
+        //    tool batch the agent requeues it so it lands as a normal follow-up
+        //    message. So the server never loses it — but promising "next tool call"
+        //    when the turn makes none overstates what happened.
+        val busyNow = uiState.isStreaming ||
+            uiState.messages.any { it.role == "assistant" && it.isStreaming }
+        if (!busyNow) {
+            addCommandAck("⚠️ Nothing running to steer — sending it as a normal message.")
+            submitPrompt(text)
+            return
+        }
+        addCommandAck("⏳ Steering into this turn (lands at the next tool boundary)…")
+        viewModelScope.launch {
+            try {
+                wsConnection.connect()
+                val r = rpcClient.sessionSteer(sessionId, text)
+                val status = r["status"]?.jsonPrimitive?.contentOrNull ?: ""
+                when (status) {
+                    "queued" -> addCommandAck("✓ Steered into this turn: $text")
+                    // The turn ended between the local check and the RPC — take the
+                    // same documented fallback rather than dropping the text.
+                    "rejected" -> {
+                        addCommandAck("⚠️ Turn finished before it could be steered — sending as a message instead.")
+                        submitPrompt(text)
+                    }
+                    else -> addCommandAck("⚠️ Steer not accepted (status=$status): $text")
+                }
+            } catch (e: JsonRpcException) {
+                if (e.code == 4010) {
+                    addCommandAck(
+                        "⚠️ This agent cannot be steered mid-turn. Use /queue to run it after this turn: $text",
+                    )
+                } else {
+                    addCommandAck("⚠️ Command failed: ${e.message}")
+                }
+            } catch (e: Exception) {
+                addCommandAck("⚠️ Command failed: ${e.message}")
+            }
+        }
+    }
+
+    /** /new or /reset — create a fresh session and navigate to it. */
+    private fun handleNewSession() {
+        viewModelScope.launch {
+            try {
+                wsConnection.connect()
+                // v0.1.901: navigate to the durable key for the same reason as above.
+                val (_, durableNew) = rpcClient.createSessionWithKey()
+                val newSid = durableNew ?: rpcClient.createSession()
+                DebugLog.log("RPC", "DashboardChat",
+                    "/new → session.create durable=$newSid" +
+                    if (durableNew == null) " (no durable key — using live sid)" else "")
+                resetTargetSession = newSid
+            } catch (e: Exception) {
+                addCommandAck("⚠️ New session failed: ${e.message}")
+            }
+        }
+    }
+
+    /** /queue <text> — send it so it runs after the current turn, with an ack. */
+    private fun handleQueue(text: String) {
+        if (text.isBlank()) {
+            addCommandAck("⚠️ /queue needs some text to queue.")
+            return
+        }
+        // v0.1.901: this used to claim "Queuing for next turn…" before it knew, and
+        // then submit WITHOUT the queue flag — so with the server's default
+        // display.busy_input_mode=interrupt the text redirected/interrupted the LIVE
+        // turn instead of waiting for the next one. Two fixes: say only what is known
+        // at that instant, and set queued=true so a /queue can never become a live
+        // correction. Idle sessions are unaffected: the busy handler no-ops and the
+        // prompt runs immediately, which is what the ack now says.
+        val busyNow = uiState.isStreaming ||
+            uiState.messages.any { it.role == "assistant" && it.isStreaming }
+        addCommandAck(if (busyNow) "⏳ Queuing for after this turn…" else "⏳ Nothing running — sending now…")
+        viewModelScope.launch {
+            try {
+                wsConnection.connect()
+                rpcClient.promptSubmit(sessionId, text, queued = true)
+                addCommandAck(if (busyNow) "✓ Queued to run after this turn: $text" else "✓ Sent: $text")
+            } catch (e: Exception) {
+                addCommandAck("⚠️ Command failed: ${e.message}")
+            }
+        }
+    }
+
+    /** Append a lightweight, non-streaming acknowledgement line to the chat. */
+    private fun addCommandAck(text: String) {
+        val msgs = uiState.messages.toMutableList()
+        msgs.add(
+            UiMessage(
+                id = "ack_${tempIdCounter.incrementAndGet()}",
+                role = "assistant",
+                content = text,
+                isCommandAck = true,
+                timestamp = System.currentTimeMillis(),
+            )
+        )
+        uiState = uiState.copy(messages = msgs)
+    }
+
+    override fun sendMessageWithImage(text: String, imageBase64: String, filename: String?) {
+        if (imageBase64.isBlank()) {
+            if (text.isNotBlank()) sendMessage(text)
+            return
+        }
+        sendImages(listOf(imageBase64), text, filename)
+    }
+
+    /** v0.7.0: multi-image send — stage every image, then submit ONE prompt. */
+    override fun sendMessageWithImages(text: String, imagesB64: List<String>) {
+        val imgs = imagesB64.filter { it.isNotBlank() }
+        if (imgs.isEmpty()) {
+            if (text.isNotBlank()) sendMessage(text)
+            return
+        }
+        sendImages(imgs, text, null)
+    }
+
+    private fun sendImages(imagesB64: List<String>, text: String, filename: String?) {
+        if (sessionId.isEmpty()) return
+        viewModelScope.launch {
+            try {
+                var lastText: String? = null
+                imagesB64.forEachIndexed { i, b64 ->
+                    DebugLog.log("RPC", "DashboardChat", "image.attach_bytes → staging ${i + 1}/${imagesB64.size} (${b64.length} chars)")
+                    val attach = rpcClient.attachImage(sessionId, b64, filename ?: "photo_${System.currentTimeMillis()}_$i.jpg")
+                    lastText = attach["text"]?.jsonPrimitive?.contentOrNull
+                }
+                // Images ride along with the next prompt; blank text uses the
+                // server's placeholder ("[User attached image: ...]").
+                val finalText = text.ifBlank { lastText ?: "[User attached image]" }
+                DebugLog.log("RPC", "DashboardChat", "images staged — submitting prompt")
+                sendMessage(finalText)
+            } catch (e: Exception) {
+                // v0.1.83: 4001 = session reaped — self-heal (resume) and retry ONCE.
+                if (e is JsonRpcException && e.code == 4001 && healReapedSessionForAttach("image.attach")) {
+                    DebugLog.log("RPC", "DashboardChat", "image.attach retrying after self-heal")
+                    try {
+                        var lastText2: String? = null
+                        imagesB64.forEachIndexed { i, b64 ->
+                            val attach2 = rpcClient.attachImage(sessionId, b64, filename ?: "photo_${System.currentTimeMillis()}_$i.jpg")
+                            lastText2 = attach2["text"]?.jsonPrimitive?.contentOrNull
+                        }
+                        sendMessage(text.ifBlank { lastText2 ?: "[User attached image]" })
+                        return@launch
+                    } catch (retry: Exception) {
+                        DebugLog.log("ERROR", "DashboardChat", "image.attach retry failed: ${retry.message}")
+                        uiState = uiState.copy(
+                            error = retry.message ?: "Image attach failed",
+                            isStreaming = false,
+                        )
+                        return@launch
+                    }
+                }
+                Log.e("Hermex", "DashboardChatViewModel: attachImage failed", e)
+                DebugLog.log("ERROR", "DashboardChat", "image.attach failed: ${e.message}")
+                uiState = uiState.copy(
+                    error = e.message ?: "Image attach failed",
+                    isStreaming = false,
+                )
+            }
+        }
+    }
+
+    override fun sendMessageWithFile(text: String, fileBase64: String, mimeType: String, filename: String?) {
+        if (sessionId.isEmpty()) return
+        if (fileBase64.isBlank()) {
+            if (text.isNotBlank()) sendMessage(text)
+            return
+        }
+        viewModelScope.launch {
+            try {
+                DebugLog.log("RPC", "DashboardChat", "file.attach → staging (${fileBase64.length} b64 chars)")
+                val dataUrl = "data:$mimeType;base64,$fileBase64"
+                val attach = rpcClient.attachFile(sessionId, dataUrl, filename)
+                val refText = attach["ref_text"]?.jsonPrimitive?.contentOrNull
+                val finalText = buildString {
+                    if (text.isNotBlank()) append(text).append('\n')
+                    append(refText ?: "[User attached file]")
+                }
+                sendMessage(finalText)
+            } catch (e: Exception) {
+                // v0.1.83: 4001 = session reaped — self-heal (resume) and retry ONCE,
+                // same recovery prompt.submit uses. Other errors surface as before.
+                if (e is JsonRpcException && e.code == 4001 && healReapedSessionForAttach("file.attach")) {
+                    DebugLog.log("RPC", "DashboardChat", "file.attach retrying after self-heal")
+                    try {
+                        val dataUrl2 = "data:$mimeType;base64,$fileBase64"
+                        val attach2 = rpcClient.attachFile(sessionId, dataUrl2, filename)
+                        val refText2 = attach2["ref_text"]?.jsonPrimitive?.contentOrNull
+                        val finalText2 = buildString {
+                            if (text.isNotBlank()) append(text).append('\n')
+                            append(refText2 ?: "[User attached file]")
+                        }
+                        sendMessage(finalText2)
+                        return@launch
+                    } catch (retry: Exception) {
+                        DebugLog.log("ERROR", "DashboardChat", "file.attach retry failed: ${retry.message}")
+                        uiState = uiState.copy(
+                            error = retry.message ?: "File attach failed",
+                            isStreaming = false,
+                        )
+                        return@launch
+                    }
+                }
+                Log.e("Hermex", "DashboardChatViewModel: attachFile failed", e)
+                DebugLog.log("ERROR", "DashboardChat", "file.attach failed: ${e.message}")
+                uiState = uiState.copy(
+                    error = e.message ?: "File attach failed",
+                    isStreaming = false,
+                )
+            }
+        }
+    }
+
+    override fun stopStreaming() {
+        viewModelScope.launch {
+            try {
+                DebugLog.log("RPC", "DashboardChat",
+                    "session.interrupt → dbKey=$sessionId liveSid=$liveSid")
+                rpcClient.sessionInterrupt(sessionId)
+            } catch (_: Exception) { /* best-effort */ }
+
+            // Clear per-message streaming flag so the blinking cursor / thinking
+            // ticker / typing dots disappear immediately (same pattern as the
+            // error handler in sendMessage).
+            val msgs = uiState.messages.toMutableList()
+            val idx = msgs.indexOfLast { it.role == "assistant" && it.isStreaming }
+            if (idx >= 0) {
+                msgs[idx] = msgs[idx].copy(isStreaming = false)
+            }
+
+            uiState = uiState.copy(
+                messages = msgs,
+                isStreaming = false,
+                pendingApproval = null,   // dismiss any visible approval dialog
+                pendingClarify = null,    // dismiss any visible clarify dialog
+            )
+        }
+    }
+
+    /** Retry the last assistant response. Finds the previous user prompt,
+     * removes the last assistant message, and re-submits the prompt. */
+    override fun retry() {
+        if (sessionId.isEmpty()) return
+
+        val msgs = uiState.messages.toMutableList()
+        val userIdx = msgs.indexOfLast { it.role == "user" }
+        if (userIdx < 0) return
+        val lastUserText = msgs[userIdx].content
+        if (lastUserText.isBlank()) return
+
+        // Remove the last assistant message (the one we're regenerating)
+        val asstIdx = msgs.indexOfLast { it.role == "assistant" }
+        if (asstIdx >= 0) {
+            msgs.removeAt(asstIdx)
+        }
+
+        // Add streaming assistant placeholder
+        // A retry re-submits the last user prompt — a fresh turn. Clear any
+        // leftover completion flag so this regenerated placeholder isn't
+        // immediately finalized by a stale turnDoneSeen.
+        this.turnDoneSeen = false
+        // v0.1.140: a fresh turn — allow the next completion to ping again.
+        this.turnNotifPosted = false
+        val assistantMsgId = "asst_${tempIdCounter.incrementAndGet()}"
+        val now = System.currentTimeMillis()
+        msgs.add(UiMessage(
+            id = assistantMsgId, role = "assistant",
+            isStreaming = true, isWaitingForFirstEvent = true, timestamp = now,
+        ))
+
+        uiState = uiState.copy(
+            messages = msgs,
+            isStreaming = true,
+            error = null,
+            pendingApproval = null,
+            pendingClarify = null,
+        )
+
+        viewModelScope.launch {
+            try {
+                DebugLog.log("RPC", "DashboardChat",
+                    "retry → dbKey=$sessionId liveSid=$liveSid text=\"${lastUserText.take(50)}\"")
+                submitWithSelfHeal(lastUserText)
+            } catch (e: Exception) {
+                val m = uiState.messages.toMutableList()
+                val idx = m.indexOfLast { it.role == "assistant" && it.isStreaming }
+                if (idx >= 0) {
+                    m[idx] = m[idx].copy(isStreaming = false)
+                }
+                uiState = uiState.copy(
+                    messages = m,
+                    isStreaming = false,
+                    error = e.message ?: "Retry failed",
+                )
+            }
+        }
+    }
+
+    /** Approve the current pending tool call. */
+    override fun approveCurrentTool(approveAll: Boolean) {
+        val pending = uiState.pendingApproval ?: return
+        DebugLog.log("RPC", "DashboardChat",
+            "approving tool: ${pending.toolName} all=$approveAll")
+        rpcClient.approvalRespond(sessionId, "approve", pending.requestId, approveAll)
+        uiState = uiState.copy(pendingApproval = null)
+    }
+
+    /** Deny the current pending tool call. */
+    override fun denyCurrentTool(denyAll: Boolean) {
+        val pending = uiState.pendingApproval ?: return
+        DebugLog.log("RPC", "DashboardChat",
+            "denying tool: ${pending.toolName} all=$denyAll")
+        rpcClient.approvalRespond(sessionId, "deny", pending.requestId, denyAll)
+        uiState = uiState.copy(pendingApproval = null)
+    }
+
+    /** Respond to the current pending clarify request. */
+    override fun respondToClarify(answer: String) {
+        val pending = uiState.pendingClarify ?: return
+        DebugLog.log("RPC", "DashboardChat",
+            "responding to clarify: requestId=${pending.requestId} answer=$answer")
+        rpcClient.clarifyRespond(pending.requestId, answer)
+        uiState = uiState.copy(pendingClarify = null)
+    }
+
+    override fun toggleThinking(messageId: String) {
+        val msgs = uiState.messages.toMutableList()
+        val idx = msgs.indexOfFirst { it.id == messageId }
+        if (idx >= 0) {
+            msgs[idx] = msgs[idx].copy(thinkingExpanded = !msgs[idx].thinkingExpanded)
+            uiState = uiState.copy(messages = msgs)
+        }
+    }
+
+    override fun onCleared() {
+        DebugLog.log("STATE", "SessionID",
+            "onCleared: sessionId=$sessionId liveSid=$liveSid resumeCount=$resumeCount")
+        super.onCleared()
+        dispose()
+    }
+
+    /**
+     * Tear down this chat ViewModel's subscriptions. Called by [ChatVmsHolder]
+     * when the Activity finishes (chat VMs now outlive navigation so turns keep
+     * running in the background).
+     *
+     * v0.1.885: does NOT disconnect. The connection is app-wide and shared by every
+     * chat session, the sessions list, soul screen and bot screen — one VM clearing
+     * must not drop everyone's socket, and the server's orphan-reaper tears down a
+     * running session 20s after a disconnect.
+     */
+    fun dispose() {
+        DebugLog.log("TRACE", "identity",
+            "event=unregister dbKey=$sessionId liveSid=${liveSid.ifBlank { "-" }} vm=$vmId " +
+            "wasCollecting=${notificationCollectorJob?.isActive == true}")
+        notificationCollectorJob?.cancel()
+        serverRequestCollectorJob?.cancel()
+        staleStreamTimeoutJob?.cancel()
+        // v0.1.897 — the poll loop belongs to this VM; an evicted VM must not keep
+        // polling (it did until now only while screenVisible stayed true).
+        pollLoopJob?.cancel()
+        pollLoopJob = null
+    }
+
+    // ── v0.1.123 stuck-spinner watchdog ──
+
+    /**
+     * Re-arm the stale-stream guard: cancel any pending timeout and start a new
+     * one. Called on every incoming notification so a healthy stream never trips
+     * it. If no event lands within the grace window while an assistant message is
+     * still `isStreaming`, clear that flag so the UI doesn't spin forever.
+     */
+    private fun armStaleStreamGuard() {
+        staleStreamTimeoutJob?.cancel()
+        staleStreamTimeoutJob = viewModelScope.launch {
+            delay(STALE_STREAM_GRACE_MS)
+            // If we've seen ANY streaming content for this message, a long gap is
+            // just agent-warmup (esp. on a fresh /new turn with no warm agent) —
+            // NOT a lost completion. Only nuke the stream if zero content events
+            // ever arrived (truly dead) or a completion was already seen server-side.
+            val stillStreaming = uiState.messages.any {
+                it.role == "assistant" && it.isStreaming
+            }
+            // v0.1.889: the tool-card gap. `UiToolCall.completed` drives the card's
+            // spinner glyph (`◌` vs `✓`) and the ticking elapsed timer, and ONLY
+            // `tool.complete` flips it. The original watchdog covered assistant
+            // `isStreaming` and never touched tool cards, so a card whose
+            // `tool.complete` is lost — ring truncated, frame never in the ring,
+            // replay unavailable — spins forever. Authority is the server's turn
+            // state: if the turn is not running, no `tool.complete` is coming, so
+            // every open card is stale by definition. A genuinely long-running tool
+            // keeps `serverTurnWasRunning=true` and is left alone.
+            val cardFix = Reconcile.closeStaleCards(uiState.messages, serverTurnWasRunning, turnDoneSeen)
+            if (cardFix != null) {
+                val (msgs, open) = cardFix
+                DebugLog.log("RPC", "DashboardChat",
+                    "v0.1.889: tool-card watchdog fired after ${STALE_STREAM_GRACE_MS}ms — " +
+                    "$open card(s) still completed=false; turnDoneSeen=$turnDoneSeen " +
+                    "serverTurnWasRunning=$serverTurnWasRunning, closing")
+                uiState = uiState.copy(messages = msgs, scrollGeneration = uiState.scrollGeneration + 1)
+                DebugLog.log("RPC", "DashboardChat", "v0.1.889: closed $open tool card(s)")
+            }
+            if (stillStreaming && !streamingContentSeen && !turnDoneSeen) {
+                DebugLog.log("RPC", "DashboardChat",
+                    "v0.1.137: stale-stream watchdog fired after ${STALE_STREAM_GRACE_MS}ms — " +
+                    "assistant message still marked isStreaming; completion signal was lost" +
+                    (if (turnDoneSeen) " (already completed server-side)" else "") + ", clearing")
+                val msgs = uiState.messages.toMutableList()
+                var cleared = 0
+                for (i in msgs.indices) {
+                    if (msgs[i].role == "assistant" && msgs[i].isStreaming) {
+                        msgs[i] = msgs[i].copy(isStreaming = false, isWaitingForFirstEvent = false)
+                        cleared++
+                    }
+                }
+                if (cleared > 0) {
+                    uiState = uiState.copy(messages = msgs, scrollGeneration = uiState.scrollGeneration + 1)
+                }
+            }
+        }
+    }
+
+    // ── Session identity (P5 A4) ──
+
+    /**
+     * Single write point for [liveSid], so every change is observable in the journal
+     * with old/new values and every live sid the gateway hands out for [sessionId] is
+     * recorded in [SessionSidRegistry]. That registry is what lets a frame carrying a
+     * rotated-but-mine sid be accepted instead of silently dropped (FIX 4).
+     */
+    private fun setLiveSid(newSid: String?, reason: String) {
+        val next = newSid ?: ""
+        if (next == liveSid) return
+        DebugLog.log("TRACE", "identity",
+            "event=live_sid dbKey=$sessionId vm=$vmId old=${liveSid.ifBlank { "-" }} " +
+            "new=${next.ifBlank { "-" }} reason=$reason")
+        liveSid = next
+        if (next.isNotEmpty()) SessionSidRegistry.note(sessionId, next, reason)
+    }
+
+    /**
+     * P5 A2: one disposition line per notification for the session this ViewModel is
+     * displaying. The D/14 investigation could not tell "the frames never reached the
+     * phone" from "they reached the parser and this ViewModel dropped them"; with one
+     * line per frame per VM, that distinction is read directly off the journal instead
+     * of inferred from absence. Volume is deliberate (~500 lines/turn).
+     */
+    private fun dispLine(n: RpcNotification, disp: String, extra: String = "") {
+        // cid comes from the frame itself (stamped at parse time), not from whatever
+        // connection is current now: after a reconnect those differ, and these lines are
+        // the client half of the join against the gateway's per-transport frame trace.
+        DebugLog.log("TRACE", "disp",
+            "cid=${n.frameCid.ifBlank { wsConnection.currentCid().ifBlank { "-" } }} " +
+            "dbKey=${sessionId.take(24)} " +
+            "sid=${n.sessionId?.take(8) ?: "-"} " +
+            "seq=${n.frameSeq} type=${n.wireType.ifBlank { n::class.simpleName ?: "?" }} " +
+            "disp=$disp vm=$vmId" + if (extra.isNotEmpty()) " $extra" else "")
+    }
+
+    // ── WebSocket lifecycle ──
+
+    private fun connectWsAndStart() {
+        viewModelScope.launch {
+            connectStartTime = System.currentTimeMillis()
+            try {
+                DebugLog.log("WS", "DashboardChat", "connecting WebSocket")
+                wsConnection.connect()
+                val connectDuration = System.currentTimeMillis() - connectStartTime
+                DebugLog.log("WS", "DashboardChat",
+                    "WebSocket connected in ${connectDuration}ms — starting RPC " +
+                    "(sessionId=$sessionId liveSid=$liveSid)")
+
+                // Start foreground service to keep the process alive
+                // (prevents WS disconnect when phone locks or app backgrounds)
+                WsKeepaliveService.start(getApplication())
+
+                // Monitor WS state transitions
+                var previousWsState: Any? = null
+                launch {
+                    wsConnection.state.collect { wsState ->
+                        // Phase 0 trace: the edge the reconnect handler keys on, made
+                        // explicit — current state, previous state, and whether this is
+                        // a CONNECTED edge. If the handler never fires, this line shows
+                        // whether the edge ever existed.
+                        val isEdge = wsState.toString().uppercase() == "CONNECTED" &&
+                            previousWsState?.toString()?.uppercase() != "CONNECTED"
+                        // v0.5.5: honest status edges. Only the RECONNECTING state (the
+                        // manager's backoff loop) surfaces "reconnecting…" — a deliberate
+                        // user disconnect stays quiet, as before. The CONNECTED edge
+                        // consumes why the socket died so the UI can say "gateway
+                        // restarted" vs a plain "reconnected" (the WS close frame is the
+                        // discriminator: 1001/1012 = graceful shutdown, failure-without-
+                        // close-frame = dead route).
+                        run {
+                            val nowC = wsState.toString().uppercase() == "CONNECTED"
+                            val wasC = previousWsState?.toString()?.uppercase() == "CONNECTED"
+                            when {
+                                nowC && !wasC -> connectionNotice = ConnectionNotice.Restored(
+                                    wsConnection.consumeLastDropReason(),
+                                )
+                                wasC && wsState == WsConnectionManager.State.Reconnecting ->
+                                    connectionNotice = ConnectionNotice.Reconnecting
+                            }
+                        }
+                        DebugLog.log("TRACE", "vm_state_rx",
+                            "state=$wsState prev=$previousWsState edge=$isEdge (sessionId=$sessionId liveSid=$liveSid)")
+                        DebugLog.log("WS", "ChatVM",
+                            "state=$wsState (sessionId=$sessionId liveSid=$liveSid)")
+                        // Detect reconnect: state changed TO Connected
+                        if (wsState.toString().uppercase() == "CONNECTED"
+                            && previousWsState != null
+                            && previousWsState.toString().uppercase() != "CONNECTED") {
+                            DebugLog.log("WS", "DashboardChat",
+                                "reconnect detected — re-registering session $sessionId")
+                            viewModelScope.launch {
+                                try {
+                                    // Fresh turn context after reconnect — clear the
+                                    // completion flag so a re-attached placeholder isn't
+                                    // immediately finalized by a stale turnDoneSeen.
+                                    // v0.1.151: keep turnDoneSeen if we've already seen a
+                                    // completion for this session, so a dropped/late completion
+                                    // during reconnect churn still force-clears the spinner.
+                                    if (!turnDoneSeen) turnDoneSeen = false
+                                    val result = rpcClient.sessionResume(sessionId, omitMessages = true)
+                                    resumeCount++
+                                    setLiveSid(result.session_id, "reconnect_resume")
+                                    resumedSessionId = result.resumed ?: sessionId
+                                    DebugLog.log("STATE", "SessionID",
+                                        "reconnect resume(#${resumeCount}): " +
+                                        "dbKey=$sessionId liveSid=$liveSid " +
+                                        "resumed=$resumedSessionId")
+                                    // Refresh the context gauge on reconnect too
+                                    val ctx = parseContextUsage(result.info)
+                                    if (ctx.first != null || ctx.second != null) {
+                                        uiState = uiState.copy(
+                                            contextUsed = ctx.first ?: uiState.contextUsed,
+                                            contextMax = ctx.second ?: uiState.contextMax,
+                                        )
+                                    }
+                                    // v0.1.135: reconcile a turn that finished while the
+                                    // socket was down. The lightweight re-attach above uses
+                                    // omitMessages=true, so if the turn COMPLETED during the
+                                    // disconnect the client never receives the completed
+                                    // message — it's left with a stale placeholder still
+                                    // marked isStreaming (UI looks "crashed" / frozen). The
+                                    // server's resume payload tells us the turn is no longer
+                                    // running; if we still think it is, do a FULL history
+                                    // reload so the final answer appears without a hard
+                                    // close + reopen.
+                                    val turnDoneServerSide = result.running == false
+                                    val localThinksStreaming = localInFlight()
+                                    // v0.1.137 — also reconcile when the server's `running`
+                                    // is ambiguous (null) but we've already seen a turn-completion
+                                    // signal locally and are still stuck streaming: a full history
+                                    // reload surfaces the finished answer instead of a frozen spinner.
+                                    // v0.1.151 — also reconcile if WE think we're still streaming
+                                    // even with no completion signal at all: under heavy reconnect
+                                    // churn (constant sessions.changed reloads) the lightweight
+                                    // omitMessages resume can miss a turn that finished mid-churn,
+                                    // leaving a stranded spinner with neither running=false nor
+                                    // turnDoneSeen set. A full history reload is safe and idempotent.
+                                    val reconcile = localThinksStreaming &&
+                                        (turnDoneServerSide || turnDoneSeen || !streamingContentSeen)
+                                    // Phase 0 trace: every gate input and the decision.
+                                    // The claim under test is "the gate never fires on a
+                                    // real mid-turn drop" — this line is the evidence, and
+                                    // its absence is the counter-evidence.
+                                    DebugLog.log("TRACE", "gate",
+                                        "resume#${resumeCount} running=${result.running} " +
+                                        "localInFlight=$localThinksStreaming turnDoneSeen=$turnDoneSeen " +
+                                        "streamingContentSeen=$streamingContentSeen reconcile=$reconcile")
+                                    if (reconcile) {
+                                        DebugLog.log("STATE", "SessionID",
+                                            "reconnect: turn finished while disconnected (server running=false, " +
+                                            "local still streaming=true) — reloading history to reconcile")
+                                        // v0.1.140: the full-history reload surfaces the finished
+                                        // answer, but only notifies if screenVisible was false at
+                                        // this instant. Post explicitly here too (guarded so it
+                                        // can't double-fire with Fix 1 on the same completion).
+                                        val shouldNotify = !screenVisible || com.hermex.v4.AppState.isBackgrounded
+                                        if (shouldNotify && !turnNotifPosted) {
+                                            turnNotifPosted = true
+                                            val last = uiState.messages.lastOrNull { it.role == "assistant" }
+                                            val preview = last?.content?.ifBlank { "Turn finished" }?.take(200) ?: "Turn finished"
+                                            runCatching {
+                                                NotificationHelper.postTurnFinished(
+                                                    getApplication(), sessionId, uiState.sessionTitle, preview,
+                                                )
+                                            }
+                                        }
+                                        // Phase 1: ask the gateway for the frames we missed.
+                                        // `event_replay.py` keeps a bounded ring per session
+                                        // and stamps a monotonic seq on every event frame, so
+                                        // the client's watermark + `session.events.since` tells
+                                        // us exactly how many frames were dropped while the
+                                        // socket was down. `truncated` means the ring window
+                                        // moved past our watermark → full refetch is the only
+                                        // correct answer. Log the verdict; the reload below is
+                                        // still the reconcile action until replay is wired.
+                                        val liveSid = result.session_id
+                                        var replayed = false
+                                        if (!liveSid.isNullOrEmpty()) {
+                                            try {
+                                                val lastSeen = rpcClient.lastSeenSeqFor(liveSid)
+                                                val replay = rpcClient.sessionEventsSince(liveSid, lastSeen)
+                                                if (!replay.truncated && replay.events.isNotEmpty()) {
+                                                    rpcClient.replayEvents(replay.events)
+                                                    replayed = true
+                                                }
+                                                DebugLog.log("TRACE", "replay_decision",
+                                                    "sid=${liveSid.take(8)} lastSeen=$lastSeen " +
+                                                    "count=${replay.count} latest=${replay.latest_seq} " +
+                                                    "truncated=${replay.truncated} " +
+                                                    "open_requests=${replay.open_requests.size} " +
+                                                    "action=${if (replayed) "replay_only" else "full_reload"}")
+                                            } catch (e: Exception) {
+                                                DebugLog.log("TRACE", "replay_decision",
+                                                    "sid=${liveSid.take(8)} FAILED ${e.javaClass.simpleName}: ${e.message}")
+                                            }
+                                        }
+                                        // Replay is load-bearing: when the ring carried every
+                                        // missed frame (not truncated), the replayed events
+                                        // already rendered the missing tool.complete / deltas,
+                                        // so the full-history refetch is skipped. Truncated,
+                                        // empty, or a failed replay call still fall back to the
+                                        // proven full reload.
+                                        if (!replayed) {
+                                            loadMessages()
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e("Hermex", "DashboardChat: reconnect resume failed", e)
+                                    DebugLog.log("ERROR", "DashboardChat",
+                                        "reconnect resume failed: ${e.message}")
+                                    // v0.1.85 (half-open fix): a failed lightweight
+                                    // re-attach leaves the WS connected but the session
+                                    // unattached — sends go into the void until the 30s
+                                    // timeout ("jpc error"). Retry with the FULL
+                                    // re-attach (resume + history reload), which is the
+                                    // proven path and handles 4001 internally.
+                                    loadMessages()
+                                }
+                            }
+                        }
+                        previousWsState = wsState
+                    }
+                }
+
+                rpcClient.start()
+                DebugLog.log("WS", "DashboardChat",
+                    "RPC client started, total=${System.currentTimeMillis() - connectStartTime}ms " +
+                    "(sessionId=$sessionId)")
+
+                // P5 A4: this ViewModel is now registered for its session's events on
+                // this connection — say so with the ids that make the journal joinable.
+                DebugLog.log("TRACE", "identity",
+                    "event=register dbKey=$sessionId liveSid=${liveSid.ifBlank { "-" }} " +
+                    "cid=${wsConnection.currentCid().ifBlank { "-" }} vm=$vmId resumeCount=$resumeCount")
+
+                // Begin collecting notifications
+                notificationCollectorJob = launch {
+                    rpcClient.notifications.collect { notification ->
+                        handleNotification(notification)
+                    }
+                }
+
+                // v0.1.170: collect server→client requests (approval/clarify/sudo/…) and
+                // route them into UI state, capturing the srq id so we can answer via
+                // respondRequest(...). These arrive with a string id + method but no
+                // result — distinct from notifications.
+                serverRequestCollectorJob = launch {
+                    rpcClient.serverRequests.collect { req ->
+                        handleServerRequest(req)
+                    }
+                }
+
+                // Load session history after connection
+                sessionLoadStartTime = System.currentTimeMillis()
+                loadMessages()
+            } catch (e: Exception) {
+                Log.e("Hermex", "DashboardChatViewModel: WebSocket connect failed", e)
+                DebugLog.log("ERROR", "DashboardChat", "WS connect failed: ${e.message}")
+                uiState = uiState.copy(
+                    error = "Connection failed: ${e.message}",
+                )
+            }
+        }
+    }
+
+    // ── RPC Notification handler ──
+
+    /** v0.1.81: commit everything buffered since the last flush as ONE uiState
+     * commit. Runs on the Main dispatcher (the notification collector), so the
+     * buffer needs no locking. Placeholder is ensured here so deltas arriving
+     * with no live stream land exactly like the old per-delta path did. */
+    private fun flushDeltas() {
+        deltaFlushJob?.cancel()
+        deltaFlushJob = null
+        if (pendingDeltaBuf.isEmpty() && pendingThinkBuf.isEmpty() && pendingTokPerSec == null) return
+        val contentChunk = pendingDeltaBuf.toString()
+        val thinkChunk = pendingThinkBuf.toString()
+        val tok = pendingTokPerSec
+        val cDel = pendingContentDeltas
+        val tDel = pendingThinkDeltas
+        pendingDeltaBuf.setLength(0)
+        pendingThinkBuf.setLength(0)
+        pendingTokPerSec = null
+        pendingContentDeltas = 0
+        pendingThinkDeltas = 0
+        // v0.1.82 aggregate line (~9/s): the log describes the run — counts,
+        // chars, rate — instead of drowning in ~30 per-delta lines/sec.
+        DebugLog.log("SSE", "DashboardChat",
+            "flush c=$cDel/${contentChunk.length}ch t=$tDel/${thinkChunk.length}ch" +
+            (tok?.let { " tok/s=${"%.1f".format(it)}" } ?: ""))
+
+        val msgs = uiState.messages.toMutableList()
+        val idx = ensureStreamingPlaceholder(msgs)
+        // Placeholder creation resets streamingContentSeen; a content-bearing flush
+        // re-marks it exactly like the original per-delta MessageDelta handler did.
+        // v0.1.897(d): THINKING counts too. The 2026-10-20 journal caught the
+        // watchdog nuking a live turn at 15:27:21 while ThinkingDeltas were still
+        // arriving — a thinking-only turn (strata/flashnext long think) left the
+        // flag false, so an 11s gap between thinking bursts read as "completion
+        // signal lost". Any streamed output is proof of life.
+        if (contentChunk.isNotEmpty() || thinkChunk.isNotEmpty()) streamingContentSeen = true
+        val cur = msgs[idx]
+        msgs[idx] = cur.copy(
+            content = if (contentChunk.isEmpty()) cur.content else cur.content + contentChunk,
+            thinkingText = if (thinkChunk.isEmpty()) cur.thinkingText
+                           else (cur.thinkingText ?: "") + thinkChunk,
+            // mirrors the original per-delta handlers: MessageDelta set
+            // thinkingHasContent, Thinking/ReasoningDelta did not
+            thinkingHasContent = cur.thinkingHasContent || contentChunk.isNotEmpty(),
+            isWaitingForFirstEvent = false,
+        )
+        uiState = uiState.copy(
+            messages = msgs,
+            isStreaming = msgs.any { it.role == "assistant" && it.isStreaming },
+            scrollGeneration = uiState.scrollGeneration + 1,
+            liveTokPerSec = tok ?: uiState.liveTokPerSec,
+        )
+        // Keep the lost-completion watchdog sliding while content flows (it was
+        // re-armed per-event before batching; per-flush is the same guard at ~9/s).
+        armStaleStreamGuard()
+    }
+
+    /** Arm the ~110ms flush heartbeat; only when the buffer is non-empty and nothing
+     * is armed — a no-cost idle check between events, not a per-delta coroutine. */
+    private fun armDeltaFlush() {
+        if (deltaFlushJob?.isActive == true) return
+        if (pendingDeltaBuf.isEmpty() && pendingThinkBuf.isEmpty() && pendingTokPerSec == null) return
+        deltaFlushJob = viewModelScope.launch {
+            delay(DELTA_FLUSH_MS)
+            flushDeltas()
+        }
+    }
+
+    /** Return the index of the live streaming assistant message, creating one
+     * if a queued turn's first event arrives with no placeholder yet (a prompt
+     * sent mid-turn gets its placeholder lazily when its deltas start). */
+    private fun ensureStreamingPlaceholder(msgs: MutableList<UiMessage>): Int {
+        val idx = msgs.indexOfLast { it.role == "assistant" && it.isStreaming }
+        if (idx >= 0) return idx
+        // New placeholder for a fresh message — reset the streaming-seen flag so
+        // the stale-stream guard starts clean (a brand-new turn may have a long
+        // cold-start gap before the first delta).
+        streamingContentSeen = false
+        msgs.add(
+            UiMessage(
+                id = "asst_${tempIdCounter.incrementAndGet()}",
+                role = "assistant",
+                isStreaming = true,
+                isWaitingForFirstEvent = true,
+                timestamp = System.currentTimeMillis(),
+            )
+        )
+        return msgs.size - 1
+    }
+
+    private fun handleNotification(n: RpcNotification) {
+        // Filter: only process events for our session
+        val nSid = n.sessionId
+        if (nSid != null && nSid.isNotEmpty() && nSid != sessionId && nSid != liveSid) {
+            // Notifications may carry either DB key or live SID — match against both.
+            //
+            // v0.1.894 FIX 4 — a THIRD case exists and used to be dropped silently: the
+            // sid is neither, but the gateway has already told us (via some other
+            // session.resume of this same dbKey) that it belongs to THIS session. Live
+            // sids are per-attach, so any second attach of the same chat — another chat
+            // ViewModel, a reconnect resume, another device — rotates the sid while this
+            // ViewModel's copy goes stale, and every following frame was filtered away.
+            // Measured in the P2 replay testbed (config SECOND_VM_SID_ROTATION): 423 of
+            // 424 frames parsed, seq-watermarked and logged, none applied; the assistant
+            // row kept whatever it had at cut over — in D/14's shape, nothing.
+            // So: adopt the rotation (and say so), do not lose the turn.
+            if (!SessionSidRegistry.isKnownFor(sessionId, nSid)) {
+                // v0.5.2: FILTERED lines were the #1 ring-buffer killer. One export after
+                // a streaming turn: 1,821 FILTERED lines in 5.1 seconds (each held VM logging
+                // every foreign MessageDelta/ReasoningDelta/ThinkingDelta), flushing the whole
+                // 4,000-entry ring — a real incident minutes earlier became unexportable.
+                // Deltas from one foreign sid now log ONCE; later deltas are counted and the
+                // tally rides on the next logged line for that sid. Non-delta foreign events
+                // stay per-event (they're rare and each is meaningful), same policy as the
+                // MATCHED side's v0.1.82 delta rule.
+                val isForeignDelta = n is RpcNotification.MessageDelta ||
+                    n is RpcNotification.ThinkingDelta ||
+                    n is RpcNotification.ReasoningDelta
+                val seenForSid = filteredForeignCounts.merge(nSid, 1) { a, b -> a + b }
+                if (!isForeignDelta || seenForSid == 1) {
+                    DebugLog.log("STATE", "SessionID",
+                        "notification FILTERED: nSid=$nSid != dbKey=$sessionId != liveSid=$liveSid " +
+                        "event=${n::class.simpleName} foreignEventsSeenForSid=$seenForSid")
+                }
+                dispLine(n, "FILTERED",
+                    "nSid=$nSid dbKey=$sessionId liveSid=$liveSid event=${n::class.simpleName} " +
+                    "knownSids=${SessionSidRegistry.sidsOf(sessionId).size}")
+                return
+            }
+            DebugLog.log("TRACE", "identity",
+                "liveSid rotated old=$liveSid new=$nSid dbKey=$sessionId vm=$vmId " +
+                "reason=frame_carries_sid_already_bound_to_this_session " +
+                "event=${n::class.simpleName}")
+            setLiveSid(nSid, "frame_sid_rotation")
+        }
+
+        // P5 A2: one disposition line per accepted notification. Terminal events log their
+        // own outcome below (they are the ones that can be a silent no-op); deltas and
+        // everything else are applied by definition once they pass the session filter.
+        val terminalEvent = n is RpcNotification.MessageCompleted || n is RpcNotification.RunCompleted
+        if (!terminalEvent) dispLine(n, "APPLIED")
+        // v0.1.82: per-delta MATCHED lines are GONE — ~30 lines/sec of streaming
+        // evicted the 1000-entry ring in ~30s, so an export after a long run
+        // contained only the crawl's tail. Deltas are counted; flushDeltas logs
+        // one aggregate line per batch (~9/sec). Non-delta events keep the
+        // per-event MATCHED line (they're rare and each is meaningful).
+        val isDeltaEvent = n is RpcNotification.MessageDelta ||
+            n is RpcNotification.ThinkingDelta || n is RpcNotification.ReasoningDelta
+        if (nSid != null && nSid.isNotEmpty() && !isDeltaEvent) {
+            DebugLog.log("STATE", "SessionID",
+                "notification MATCHED: nSid=$nSid dbKey=$sessionId liveSid=$liveSid " +
+                "event=${n::class.simpleName}")
+        }
+
+        // ── v0.1.81: streaming-delta fast path ──
+        // Buffer token/thinking deltas and commit them in ~110ms batches (flushDeltas).
+        // Per-delta commits re-render the streaming bubble ~30x/sec (full list copy +
+        // full Markdown re-parse of a growing string + scroll pass) — during long
+        // thinking runs this saturated the main thread, lagged all touch input, and
+        // heated the phone until users force-killed the app.
+        if (n is RpcNotification.MessageDelta || n is RpcNotification.ThinkingDelta ||
+            n is RpcNotification.ReasoningDelta
+        ) {
+            if (n is RpcNotification.MessageDelta) {
+                streamingContentSeen = true  // first real content: stale-stream guard stands down
+                n.text?.let { pendingDeltaBuf.append(it); pendingContentDeltas++ }
+                n.predictedPerSecond?.let { pendingTokPerSec = it }
+            } else {
+                val dtext = if (n is RpcNotification.ThinkingDelta) n.text
+                            else (n as RpcNotification.ReasoningDelta).text
+                // v0.1.897(d): thinking/reasoning deltas are stream activity too —
+                // mark at append time so the guard stands down immediately, not
+                // only after the 110ms flush (the flush re-marks post-placeholder).
+                dtext?.let {
+                    streamingContentSeen = true
+                    pendingThinkBuf.append(it); pendingThinkDeltas++
+                }
+            }
+            if (pendingDeltaBuf.length + pendingThinkBuf.length >= DELTA_FLUSH_CHAR_CAP) {
+                flushDeltas()  // cap: very fast streams commit sooner, bounded lag
+            } else {
+                armDeltaFlush()
+            }
+            return
+        }
+
+        // Non-delta event: land any buffered deltas FIRST — they precede this event on
+        // the wire, so the message list must show them before e.g. message.completed
+        // finalizes the bubble (wire order preserved).
+        flushDeltas()
+        armStaleStreamGuard()
+
+        val msgs = uiState.messages.toMutableList()
+
+        // v0.1.897(f) — "thinking disappears when tools start". The gateway emits
+        // message.completed per assistant SEGMENT, not per turn: thinking → tool
+        // calls → more thinking is several completed segments inside one live turn.
+        // The first segment's completion sets turnDoneSeen=true; then the tail
+        // force-close below saw the next segment's placeholder as "stray" and set
+        // the global isStreaming=false while the row itself stayed streaming. That
+        // combination hides the docked live panel AND suppresses the per-message
+        // ThinkingScrollBox (which requires !isStreaming) — so thinking kept
+        // accumulating but rendered nowhere until the next completion. A tool or
+        // new-segment event is proof the turn continues: clear the flag.
+        if ((n is RpcNotification.ToolGenerating || n is RpcNotification.ToolStart ||
+             n is RpcNotification.MessageStarted) && turnDoneSeen) {
+            DebugLog.log("TRACE", "DashboardChat",
+                "v0.1.897(f): ${n::class.simpleName} after a message.completed — this is a new " +
+                "segment of a still-running turn; clearing turnDoneSeen so the live panel keeps rendering")
+            turnDoneSeen = false
+        }
+
+        // v0.1.123/137 safety net — stuck-spinner guard. If a streaming content
+        // event (delta / tool event) arrives but there is NO live streaming
+        // assistant message, the completion event that was supposed to clear
+        // `isStreaming` was dropped/late/out-of-order and we'd otherwise strand a
+        // spinner forever (the "frozen" bug). Re-establish a placeholder so the
+        // late content has somewhere to land and finalize on the next completed
+        // event, instead of leaving the UI stuck.
+        if (n is RpcNotification.MessageDelta ||
+            n is RpcNotification.ThinkingDelta ||
+            n is RpcNotification.ReasoningDelta ||
+            n is RpcNotification.ToolGenerating ||
+            n is RpcNotification.ToolStart ||
+            n is RpcNotification.ToolComplete
+        ) {
+            val hasLiveStream = msgs.any { it.role == "assistant" && it.isStreaming }
+            if (!hasLiveStream) {
+                DebugLog.log("RPC", "DashboardChat",
+                    "v0.1.137: ${n::class.simpleName} arrived with no live stream — " +
+                    "completion was lost, re-establishing placeholder to avoid stuck spinner" +
+                    (if (turnDoneSeen) " (turn already completed server-side)" else ""))
+                ensureStreamingPlaceholder(msgs)
+            }
+        }
+
+        when (n) {
+            is RpcNotification.GatewayReady -> {
+                DebugLog.log("RPC", "DashboardChat",
+                    "gateway.ready — agent=${n.agentId} v${n.version} " +
+                    "sessionId=${n.sessionId}")
+                val gwSessionId = n.sessionId
+                if (gwSessionId != null && gwSessionId.isNotEmpty()) {
+                    DebugLog.log("STATE", "SessionID",
+                        "gateway.ready gwSessionId=$gwSessionId " +
+                        "(our dbKey=${this.sessionId} liveSid=$liveSid)")
+                }
+            }
+
+            // v0.5.9: subagent lifecycle frames belong to the Children sheet
+            // (ChildrenSheetState collects them from the shared notification flow);
+            // the chat stream itself takes no action on them.
+            is RpcNotification.SubagentUpdate -> Unit
+
+            is RpcNotification.RunStarted -> {
+
+                // No UI change needed — streaming placeholder already visible
+            }
+
+            is RpcNotification.MessageStarted -> {
+                DebugLog.log("RPC", "DashboardChat",
+                    "message.start — serverId=${n.messageId}")
+                // v0.1.897(f): a new assistant segment PROVES this turn is still
+                // running. The gateway emits message.completed per segment, so on a
+                // multi-segment turn (thinking → tools → thinking → answer) an early
+                // segment's completion set turnDoneSeen=true; the v0.1.137 tail
+                // force-close then cleared the global streaming flag while the row
+                // stayed streaming — hiding the dock panel AND suppressing the
+                // ThinkingScrollBox at the same time, so streamed thinking simply
+                // vanished when tools began. The flag means *segment* done, not
+                // turn done — reset it wherever the turn demonstrably continues.
+                if (turnDoneSeen) turnDoneSeen = false
+                val serverId = n.messageId
+                val idx = ensureStreamingPlaceholder(msgs)
+                msgs[idx] = msgs[idx].copy(
+                    id = serverId ?: msgs[idx].id,
+                    isWaitingForFirstEvent = false,
+                )
+            }
+
+            is RpcNotification.ReasoningAvailable -> {
+                val idx = ensureStreamingPlaceholder(msgs)
+                val cur = msgs[idx]
+                val existing = cur.thinkingText ?: ""
+                msgs[idx] = cur.copy(
+                    thinkingHasContent = true,
+                    thinkingText = existing,
+                )
+            }
+
+            is RpcNotification.MessageDelta -> {
+                val idx = ensureStreamingPlaceholder(msgs)
+                val cur = msgs[idx]
+                // First real streaming content for this message — mark so the
+                // stale-stream guard won't mistake a cold-start gap for a lost
+                // completion (see armStaleStreamGuard).
+                streamingContentSeen = true
+                msgs[idx] = cur.copy(
+                    content = cur.content + n.text,
+                    thinkingHasContent = true,
+                    isWaitingForFirstEvent = false,
+                )
+                // v0.1.110: forward server-reported tok/s to UI for the live readout.
+                n.predictedPerSecond?.let { pps ->
+                    uiState = uiState.copy(liveTokPerSec = pps)
+                }
+            }
+
+            is RpcNotification.ThinkingDelta -> {
+                val idx = ensureStreamingPlaceholder(msgs)
+                val cur = msgs[idx]
+                val existing = cur.thinkingText ?: ""
+                msgs[idx] = cur.copy(
+                    thinkingText = existing + n.text,
+                    isWaitingForFirstEvent = false,
+                )
+            }
+
+            is RpcNotification.ReasoningDelta -> {
+                // Treat reasoning same as thinking — append to thinkingText
+                val idx = ensureStreamingPlaceholder(msgs)
+                val cur = msgs[idx]
+                val existing = cur.thinkingText ?: ""
+                val text = n.text ?: ""
+                msgs[idx] = cur.copy(
+                    thinkingText = existing + text,
+                    isWaitingForFirstEvent = false,
+                )
+            }
+
+            is RpcNotification.ToolGenerating -> {
+                DebugLog.log("RPC", "ToolEvent", "generating: ${n.toolName}")
+                val idx = ensureStreamingPlaceholder(msgs)
+                val cur = msgs[idx]
+                val existing = cur.toolCalls.toMutableList()
+                // _thinking and todo are rendered as dedicated UI (thinking
+                // block / Tasks card), not as tool cards.
+                if (n.toolName != "_thinking" && n.toolName != "todo") {
+                    val tc = UiToolCall(
+                        id = "tc_${existing.size}",
+                        toolName = n.toolName,
+                    )
+                    existing.add(tc)
+                }
+                msgs[idx] = cur.copy(
+                    toolCalls = existing,
+                    isWaitingForFirstEvent = false,
+                )
+            }
+
+            is RpcNotification.ToolStart -> {
+                DebugLog.log("RPC", "ToolEvent", "start: toolId=${n.toolId} name=${n.toolName} context=${n.context ?: ""}")
+                if (n.toolName == "todo") return
+                val idx = ensureStreamingPlaceholder(msgs)
+                val cur = msgs[idx]
+                // v0.8.1: a tool starting closes the current thinking segment —
+                // any further thinking becomes its own THOUGHT box.
+                val thinkingNow = cur.thinkingText.orEmpty()
+                val segClosed = thinkingNow.isNotBlank()
+                val updated = cur.toolCalls.map { tc ->
+                    // Match by id, or the FIRST not-yet-started card with this
+                    // name (a tool that runs twice must not overwrite the
+                    // previous run's id — that created duplicate ids → crash).
+                    if (tc.id == n.toolId || (tc.toolName == n.toolName && tc.startedAt == null)) tc.copy(
+                        id = n.toolId,
+                        preview = n.context,
+                        startedAt = System.currentTimeMillis(),
+                    ) else tc
+                }
+                val segs = if (segClosed) cur.priorThinking + com.hermex.v4.feature.chat.ThinkingSeg(beforeToolId = n.toolId, text = thinkingNow) else cur.priorThinking
+                msgs[idx] = cur.copy(
+                    toolCalls = updated,
+                    priorThinking = segs,
+                    thinkingText = if (segClosed) null else cur.thinkingText,
+                )
+            }
+
+            is RpcNotification.ToolComplete -> {
+                DebugLog.log("RPC", "ToolEvent", "complete: toolId=${n.toolId} name=${n.toolName} summary=${n.summary ?: ""} args=${n.args?.toString()?.take(100) ?: ""}")
+                // todo tool.complete is the source of truth for the task list —
+                // update the Tasks card, not a tool card.
+                if (n.toolName == "todo") {
+                    val todos = parseTodos(n.result)
+                    if (todos != null) {
+                        uiState = uiState.copy(
+                            todos = todos,
+                            // Auto-expand the first time a task list appears during
+                            // a turn; once the user collapses it, respect that.
+                            todosExpanded = uiState.todosExpanded ||
+                                (uiState.todos.isEmpty() && uiState.isStreaming),
+                        )
+                    }
+                    return
+                }
+                val idx = ensureStreamingPlaceholder(msgs)
+                val cur = msgs[idx]
+                val updated = cur.toolCalls.map { tc ->
+                    // Match by id, or the first not-yet-completed card with
+                    // this name (repeated tool runs must update THEIR card).
+                    if (tc.id == n.toolId || (tc.toolName == n.toolName && !tc.completed)) tc.copy(
+                        completed = true,
+                        args = n.args?.toString() ?: tc.args,
+                        preview = n.summary ?: tc.preview,
+                        result = n.result?.toString(),
+                        summary = n.summary,
+                        inlineDiff = n.inlineDiff ?: tc.inlineDiff,
+                    ) else tc
+                }
+                msgs[idx] = cur.copy(toolCalls = updated)
+            }
+
+            is RpcNotification.MessageCompleted -> {
+                DebugLog.log("RPC", "DashboardChat", "message.completed — finalizing")
+                // The turn is done server-side — record that so even if this
+                // message's content was already applied, we clear the spinner
+                // immediately (no 45s watchdog wait) and a later stray delta can
+                // land on a fresh placeholder instead of stranding the UI.
+                this.turnDoneSeen = true
+                clearInFlight(sessionId)
+                // v0.1.894 FIX 3 — an id-keyed UPSERT, never a silent no-op. The old
+                // code did `indexOfLast { role == "assistant" }` and did nothing at all
+                // when no such row existed: a client that attached late (or whose history
+                // was re-read mid-turn) received `message.complete` with the full answer
+                // in hand and rendered nothing — measured in the P2 testbed as
+                // SECOND_VM@422 ending with NO_ROW. The target-row choice is now the
+                // tested Reconcile.terminalUpsertTarget (exact id, then streaming row, then
+                // a same-turn fallback, else create).
+                val serverMsgId = n.messageId?.takeIf { it.isNotBlank() }
+                // The selection rule lives in Reconcile.terminalUpsertTarget so it can be
+                // unit-tested without a phone (ReconcileTerminalUpsertTest): exact server id,
+                // then the row that is actually streaming, then a last-assistant fallback ONLY
+                // if it belongs to this turn. A finished answer from an earlier turn must never
+                // be overwritten — that would trade the blank-row bug for a lost answer.
+                val (upIdx, refuseReason) = Reconcile.terminalUpsertTarget(msgs, serverMsgId)
+                var idx = upIdx
+                if (refuseReason != null) {
+                    DebugLog.log("TRACE", "upsert",
+                        "message.complete REFUSED a fallback row: $refuseReason " +
+                        "wantedId=${serverMsgId ?: "-"} sid=${n.sessionId?.take(8)} " +
+                        "seq=${n.frameSeq} vm=$vmId — creating a new row instead of " +
+                        "overwriting an earlier turn")
+                }
+                val deliversAnything = !n.content.isNullOrBlank() || !n.toolCalls.isNullOrEmpty()
+                if (idx < 0 && deliversAnything) {
+                    msgs.add(
+                        UiMessage(
+                            id = serverMsgId ?: "asst_${tempIdCounter.incrementAndGet()}",
+                            role = "assistant",
+                            timestamp = System.currentTimeMillis(),
+                        )
+                    )
+                    idx = msgs.size - 1
+                    DebugLog.log("TRACE", "upsert",
+                        "message.complete for a session with NO assistant row — created " +
+                        "row id=${msgs[idx].id} sid=${n.sessionId?.take(8)} seq=${n.frameSeq} " +
+                        "contentLen=${n.content?.length ?: 0} vm=$vmId")
+                } else if (idx < 0) {
+                    dispLine(n, "NO_ROW",
+                        "reason=terminal_event_carried_no_content_and_no_local_row_exists")
+                }
+                if (idx >= 0) {
+                    val cur = msgs[idx]
+                    val finalContent = n.content?.takeIf { it.isNotBlank() } ?: cur.content
+                    // Keep live-accumulated tool calls (preserve preview/args from
+                    // ToolGenerating/ToolStart/ToolComplete). Only copy server IDs
+                    // from message.tool_calls so tool cards don't lose their context
+                    // when MessageCompleted replaces the list wholesale.
+                    val serverTools = n.toolCalls.orEmpty()
+                    val finalTools = cur.toolCalls.map { liveTc ->
+                        val serverMatch = serverTools.firstOrNull {
+                            it.function?.name == liveTc.toolName
+                        }
+                        liveTc.copy(
+                            id = serverMatch?.id ?: liveTc.id,
+                            completed = true,
+                        )
+                    }
+                    val usage = n.usage?.let {
+                        UiUsage(
+                            it.promptTokens ?: 0,
+                            it.completionTokens ?: 0,
+                            it.totalTokens ?: 0,
+                            it.estimatedCostUsd,
+                            it.predictedPerSecond,
+                        )
+                    }
+                    msgs[idx] = cur.copy(
+                        id = n.messageId ?: cur.id,
+                        content = finalContent,
+                        toolCalls = finalTools,
+                        isStreaming = false,
+                        thinkingExpanded = false,
+                        thinkingHasContent = true,
+                        usage = usage,
+                    )
+                    // v0.1.74/75: turn-finished notification — fire when the
+                    // user is NOT watching this chat: navigated away (screen
+                    // not visible) OR the app is backgrounded.
+                    if (!screenVisible || com.hermex.v4.AppState.isBackgrounded) {
+                        val title = uiState.sessionTitle.ifBlank { sessionId }
+                        NotificationHelper.postTurnFinished(
+                            getApplication(), sessionId, title, finalContent,
+                        )
+                    }
+                }
+                // A2: the terminal event's own disposition (NO_ROW was already logged
+                // above when nothing could be applied).
+                if (idx >= 0) {
+                    dispLine(n, "APPLIED",
+                        "rowId=${msgs[idx].id} contentLen=${msgs[idx].content.length} " +
+                        "createdByUpsert=${deliversAnything && msgs[idx].id == (serverMsgId ?: "")}")
+                }
+                uiState = uiState.copy(
+                    messages = msgs,
+                    isStreaming = false,
+                    liveTokPerSec = null,
+                    scrollGeneration = uiState.scrollGeneration + 1,
+                )
+                onTurnFinished()
+                return  // already set uiState
+            }
+
+            is RpcNotification.RunCompleted -> {
+                // run.completed means the server finished the turn. If it arrived
+                // before/without message.completed (out-of-order or dropped), we
+                // still know the turn is done — record it so a later stray delta
+                // re-establishes a placeholder rather than stranding this spinner.
+                this.turnDoneSeen = true
+                clearInFlight(sessionId)
+                // v0.1.140: run.completed is the primary "turn done" signal but
+                // the block above never posted a turn-finished notification when
+                // away. Mirror the MessageCompleted path so completed-while-away
+                // turns actually ping. Guarded by turnNotifPosted so it can't
+                // double-fire with the reconnect reconciliation on the same turn.
+                val shouldNotify = !screenVisible || com.hermex.v4.AppState.isBackgrounded
+                if (shouldNotify && !turnNotifPosted) {
+                    turnNotifPosted = true
+                    val preview = uiState.messages.lastOrNull { it.role == "assistant" }
+                        ?.content?.ifBlank { "Turn finished" }?.take(200) ?: "Turn finished"
+                    runCatching {
+                        NotificationHelper.postTurnFinished(
+                            getApplication(), sessionId, uiState.sessionTitle, preview,
+                        )
+                    }
+                }
+                onTurnFinished()
+                // run.completed carries no text of its own: it can finalize a row, never
+                // create one. Say which of the two happened (A2 vocabulary).
+                dispLine(n, if (uiState.messages.any { it.role == "assistant" }) "APPLIED" else "NO_ROW",
+                    "reason=run_completed_no_text")
+                uiState = uiState.copy(isStreaming = false)
+                return
+            }
+
+            is RpcNotification.ApprovalRequest -> {
+                val rawToolName = n.toolName
+                val argsStr = n.args?.toString() ?: ""
+                val trimmedArgs = argsStr.trim()
+
+                // Primary source: the server sends the real (redacted) command at
+                // params.command and a human-readable description. Use those directly.
+                var commandLine = n.command?.trim().orEmpty()
+                val serverDescription = n.description?.trim().orEmpty()
+                var toolName = rawToolName.orEmpty().ifBlank { "command" }
+
+                // Fallback for older servers that don't send params.command: still
+                // try to pull a command out of the nested args blob.
+                if (commandLine.isBlank()) {
+                    if (trimmedArgs.startsWith("{") && trimmedArgs.endsWith("}")) {
+                        try {
+                            val json = Json.parseToJsonElement(trimmedArgs)
+                            if (json is JsonObject) {
+                                for (field in listOf("cmd", "command", "arguments", "arg", "query", "text", "content", "path", "file_path")) {
+                                    if (field in json) {
+                                        val valEl = json[field]!!
+                                        if (valEl.jsonPrimitive != null) {
+                                            commandLine = valEl.jsonPrimitive.contentOrNull ?: ""
+                                            break
+                                        } else if (valEl.jsonArray.isNotEmpty()) {
+                                            commandLine = valEl.jsonArray.joinToString(" ") { it.toString() }
+                                            break
+                                        }
+                                    }
+                                }
+                                if (toolName == "command" && "tool" in json) {
+                                    val toolEl = json["tool"]
+                                    if (toolEl?.jsonPrimitive != null) {
+                                        toolName = toolEl.jsonPrimitive.contentOrNull ?: "command"
+                                    }
+                                }
+                            }
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                // Prefer the server's own description; fall back to a built one.
+                val desc = if (serverDescription.isNotBlank()) {
+                    serverDescription.take(1000)
+                } else {
+                    buildString {
+                        append("Runs ")
+                        append(toolName)
+                        if (commandLine.isNotBlank()) {
+                            append("\n")
+                            append(commandLine.take(500))
+                        } else if (trimmedArgs.isNotBlank()) {
+                            append(" with: ")
+                            append(trimmedArgs.take(300))
+                        }
+                    }
+                }
+                DebugLog.log("RPC", "DashboardChat",
+                    "approval request received: tool=$toolName command=${commandLine.ifBlank { "<none>" }}")
+                uiState = uiState.copy(
+                    pendingApproval = PendingApproval(
+                        toolName = toolName,
+                        toolArgs = argsStr,
+                        description = desc,
+                    )
+                )
+                // v0.1.84: ping when the user isn't watching this chat —
+                // otherwise approval requests sit unseen until timeout.
+                if (!screenVisible || AppState.isBackgrounded) {
+                    NotificationHelper.postApproval(
+                        getApplication(),
+                        sessionId,
+                        toolName,
+                        commandLine.ifBlank { argsStr }.take(200),
+                    )
+                }
+            }
+
+            is RpcNotification.ClarifyRequest -> {
+                DebugLog.log("RPC", "DashboardChat", "clarify request received: requestId=${n.requestId} question=${n.question ?: ""} choices=${n.choices}")
+                uiState = uiState.copy(
+                    pendingClarify = PendingClarify(
+                        requestId = n.requestId,
+                        question = n.question ?: "",
+                        choices = n.choices ?: emptyList(),
+                    )
+                )
+            }
+
+            is RpcNotification.SessionInfo -> {
+                DebugLog.log("RPC", "DashboardChat", "session.info received")
+                val context = parseContextUsage(n.info)
+                // session.info also carries the live model + reasoning_effort —
+                // refresh the chip so a config.set switch (or desktop/Telegram
+                // switch) reflects here without a full resume.
+                val infoModel = n.info?.get("model")?.jsonPrimitive?.contentOrNull
+                val infoReasoning = n.info?.get("reasoning_effort")?.jsonPrimitive?.contentOrNull
+                // session.info carries the authoritative yolo flag — the button
+                // reads this instead of a separate REST call, and updates live
+                // whenever yolo is toggled from any surface.
+                val infoYolo = n.info?.get("yolo")?.jsonPrimitive?.contentOrNull
+                uiState = uiState.copy(
+                    contextUsed = context.first ?: uiState.contextUsed,
+                    contextMax = context.second ?: uiState.contextMax,
+                    currentModel = infoModel ?: uiState.currentModel,
+                    currentReasoning = infoReasoning?.takeIf { it.isNotBlank() }
+                        ?: uiState.currentReasoning,
+                    yoloEnabled = infoYolo?.toBooleanStrictOrNull() ?: uiState.yoloEnabled,
+                )
+            }
+
+            is RpcNotification.SessionChanged -> {
+                // Global broadcast — the session list changed server-side. The
+                // SessionsViewModel observes this and refetches; here we just
+                // note it so the event isn't silently dropped.
+                DebugLog.log("RPC", "DashboardChat", "sessions.changed — SessionsVM will reload")
+            }
+
+            is RpcNotification.SessionTitle -> {
+                // Auto-titling named this session. Until now the phone kept whatever placeholder it
+                // invented at open ("New session" / the create-time id) and the real name only appeared
+                // after a reopen — which is the one moment a title matters, right after the first turn.
+                // No id guard here, deliberately: the sid gate above has already routed this frame to this
+                // ViewModel, and comparing against the payload's session KEY is what broke on device — for
+                // an in-app-created chat the frame id (18c053ac) and the server's session key
+                // (20261019_191332_38e061) legitimately differ, so a key comparison dropped the event.
+                // Both ids are logged so that relationship stays auditable.
+                sessionTitle = n.title
+                uiState = uiState.copy(sessionTitle = n.title)
+                DebugLog.log("STATE", "DashboardChat",
+                    "session.title applied — header renamed (titleLen=${n.title.length} " +
+                        "sid=${n.sessionId?.take(8)} key=${n.storedKey?.take(24)} dbKey=${sessionId?.take(8)})")
+            }
+
+            // ── Parsed-but-unrendered protocol events (see ProtocolTrace.kt) ──
+            // The five events the trial journals used to log as `unknown event`. They are typed
+            // now, but NONE of them has an existing surface to wire into, so each gets one
+            // bounded TRACE line instead of being rendered. That is a deliberate refusal to
+            // invent UI, not an oversight:
+            //  • status.update — a transient status line (kinds seen live: process, lifecycle,
+            //    compacting, compacted; contract also names goal/loop/heartbeat/status). The chat
+            //    UI has no transient-status slot, and appending it to a bubble would put
+            //    server-marked-transient text permanently into the transcript.
+            //  • agent.terminal.output — stdout of an agent-owned background process. There is no
+            //    process surface anywhere in the app (`process_id` appears in no client model), so
+            //    there is nothing to append these chunks to.
+            //  • review.summary — the agent's self-improvement review of the last turn. Not
+            //    transcript content, and there is no notice/inbox surface in-app to hold it.
+            //  • cron.changed / platforms.changed — change_watcher signals whose payload is `{}`
+            //    by contract ("refetch X"). The session list already has its own signal
+            //    (sessions.changed → SessionsViewModel reload); the cron list is fetched
+            //    imperatively inside CronScreen's `remember` with no state holder to invalidate,
+            //    and platform status has no screen at all. Refetching from here would mean
+            //    inventing both a cache and an invalidation path.
+            is RpcNotification.StatusUpdate, is RpcNotification.TerminalOutput,
+            is RpcNotification.ReviewSummary, is RpcNotification.CronChanged,
+            is RpcNotification.PlatformsChanged -> traceUnrenderedEvent(n)
+
+            is RpcNotification.Unknown -> {
+                Log.w("Hermex", "DashboardChat: unknown event: ${n.eventType}")
+                DebugLog.log("RPC", "DashboardChat", "unknown event: ${n.eventType} — rawParams=${n.rawParams?.toString()?.take(200)}")
+            }
+        }
+
+        // v0.1.137 — self-healing finalization. Normally `isStreaming` follows
+        // whether any assistant message is still streaming (a queued turn's
+        // first delta creates its placeholder mid-turn). BUT if we've already
+        // received a completion signal for this turn (`turnDoneSeen`) and the
+        // only thing still marked streaming is a stale/stray placeholder, force
+        // it closed here so a dropped/out-of-order completion can never strand
+        // a spinner forever — even on a short "status check" turn with no tools.
+        val forcedClosed = turnDoneSeen && msgs.any { it.role == "assistant" && it.isStreaming }
+        uiState = uiState.copy(
+            messages = msgs,
+            isStreaming = if (forcedClosed) false else msgs.any { it.role == "assistant" && it.isStreaming },
+            scrollGeneration = uiState.scrollGeneration + 1,
+        )
+        // A forced close just changed the last message's shape — bump scroll so
+        // the final bubble settles at the bottom (mirrors the completion paths).
+        if (forcedClosed) {
+            DebugLog.log("RPC", "DashboardChat", "v0.1.137: turn already completed but a placeholder was still streaming — force-closed to clear spinner")
+        }
+    }
+
+    /** Volume gate for protocol-trace lines, per event name (see ProtoTraceGate). */
+    private val protoTraceGate = ProtoTraceGate()
+
+    /**
+     * One structured TRACE line for an event that is parsed but has no UI surface. Ids and
+     * counts only — NEVER payload text: the debug journal is shareable and these payloads carry
+     * raw process output, review text and provider-retry status lines.
+     *
+     * Bounded because `platforms.changed` fires on a 5 s floor; see [ProtoTraceGate]. The frame's
+     * own disposition line (`dispLine`, above) already proves delivery per frame — this line adds
+     * the payload-independent fields (kind / process id / lengths) that explain what arrived.
+     */
+    private fun traceUnrenderedEvent(n: RpcNotification) {
+        val line = ProtocolTrace.plan(n) ?: return
+        if (!protoTraceGate.shouldLog(line.name)) return
+        DebugLog.log("TRACE", "proto", ProtocolTrace.format(line, protoTraceGate.countOf(line.name), n))
+    }
+
+    override fun toggleTodosExpanded() {
+        uiState = uiState.copy(todosExpanded = !uiState.todosExpanded)
+    }
+
+    // ── v0.1.170: server→client requests (approval/clarify/sudo/…) ──
+    //
+    // These arrive with a string id (`srq-<hex>`) + `method` but NO result/error — the
+    // gateway is asking a question and waiting for one JSON-RPC response frame on that id.
+    // Distinct from notifications (no id). We mirror the notification handlers to populate
+    // UI state, then answer via respondRequest(...). Parsing reads params at top level, since
+    // server→client requests place fields directly under params (unlike notifications, which
+    // nest them under params["payload"]).
+
+    private fun handleServerRequest(req: JsonRpcClient.ServerRequest) {
+        val p = req.params
+        when (req.method) {
+            "approval" -> {
+                // Server→client approval params sit at the top level of `params`
+                // (request_id, command, description, choices, tool_name, allow_permanent,
+                // smart_denied — see ApprovalRequestParams), unlike notifications which
+                // nest under params["payload"].
+                val commandLine = p["command"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                val serverDescription = p["description"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                val rawToolName = p["tool_name"]?.jsonPrimitive?.contentOrNull.orEmpty().ifBlank { "command" }
+
+                DebugLog.log("RPC", "DashboardChat",
+                    "server→client approval request: id=${req.id} tool=$rawToolName command=${commandLine.ifBlank { "<none>" }}")
+
+                uiState = uiState.copy(
+                    pendingApproval = PendingApproval(
+                        toolName = rawToolName,
+                        toolArgs = "",
+                        description = serverDescription.ifBlank { "Runs ${rawToolName}" },
+                        requestId = req.id,  // v0.1.170: capture so we can respond via JSON-RPC
+                    )
+                )
+
+                // When the user isn't watching, also push a notification so the approval is
+                // seen before the gateway deadline. The dialog + response come from the approve/deny
+                // buttons calling approveCurrentTool() / denyCurrentTool(), which now answer via the
+                // captured request id.
+                if (!screenVisible || AppState.isBackgrounded) {
+                    runCatching {
+                        NotificationHelper.postApproval(
+                            getApplication(), sessionId, rawToolName,
+                            commandLine.ifBlank { "" }.take(200),
+                        )
+                    }
+                }
+            }
+
+            "clarify" -> {
+                val requestId = p["request_id"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                    ?: p["requestId"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                val question = p["question"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                val choicesArr = p["choices"] as? JsonArray
+                val choices = choicesArr?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+                    ?.filter { it.isNotBlank() }.orEmpty()
+
+                DebugLog.log("RPC", "DashboardChat",
+                    "server→client clarify request: id=$requestId question=$question")
+
+                uiState = uiState.copy(
+                    pendingClarify = PendingClarify(
+                        requestId = requestId,
+                        question = question,
+                        choices = choices,
+                    )
+                )
+            }
+
+            else -> {
+                Log.w("Hermex", "DashboardChat: unhandled server→client request: ${req.method}")
+                DebugLog.log("RPC", "DashboardChat",
+                    "server→client request: method=${req.method} id=${req.id} — no local handler")
+                // Answer with -32601 (method not found) so the gateway fails fast instead of
+                // stalling out its deadline. This matches createServerRequestHandler's contract.
+                respondJsonRpc(req.id, buildJsonObject {
+                    put("error", buildJsonObject {
+                        put("code", JsonPrimitive(-32601))
+                        put("message", JsonPrimitive("method not found: ${req.method}"))
+                    })
+                })
+            }
+        }
+    }
+
+    /** Answer a server→client request with one JSON-RPC response frame on the same id. */
+    private fun respondJsonRpc(id: String, result: JsonObject) {
+        rpcClient.respondRequest(id, result)
+    }
+
+
+    override suspend fun completeSlash(text: String): List<JsonRpcClient.SlashItem> =
+        rpcClient.completeSlash(text)
+
+    // ── v0.1.88: model picker ──
+
+    /** Model options for the picker sheet. */
+    override suspend fun loadModelOptions(): JsonRpcClient.ModelOptionsResult = rpcClient.modelOptions()
+
+    /**
+     * Persist the user's model + thinking/effort pick (applies to NEW sessions) +
+     * reflect it. [thinkingOn] flips reasoning "off" when false — persisted as the
+     * "off" effort level so new sessions don't reason. [reasoning] is the chosen
+     * non-off level (ignored when [thinkingOn] is false).
+     */
+    override fun saveModelPick(model: String, reasoning: String, thinkingOn: Boolean) {
+        val effort = if (thinkingOn) reasoning.ifBlank { DEFAULT_EFFORT } else "off"
+        viewModelScope.launch {
+            val settingsRepo = SettingsRepository(getApplication())
+            settingsRepo.setModelPick(model)
+            settingsRepo.setReasoningPick(effort)
+            uiState = uiState.copy(currentReasoning = effort.ifBlank { null })
+        }
+    }
+
+    /**
+     * v0.1.89/90/91: switch THIS session's model/effort mid-conversation.
+     *
+     * v0.1.90 sent `/model` + `/reasoning` via slash.exec — broken: the server's
+     * slash-exec mirror (`_mirror_slash_side_effects`) has NO reasoning branch
+     * (so /reasoning silently no-ops the live session) and its /model branch
+     * requires a live agent (fresh/reaped sessions no-op) and rejects a busy
+     * session instead of deferring. v0.1.91 uses the `config.set` RPC — the
+     * desktop's path — which defers a busy model switch to the next turn and
+     * builds the agent for a fresh session. `config.set` resolves `_sessions`
+     * by LIVE SID only, so send the resolved live sid (fall back to sessionId,
+     * which IS the live sid for a just-created session).
+     */
+    override fun applyModelToSession(model: String, reasoning: String, thinkingOn: Boolean) {
+        viewModelScope.launch {
+            try {
+                val sid = liveSid.ifBlank { sessionId }
+                if (model.isNotBlank()) {
+                    val res = rpcClient.configSet(sid, "model", model)
+                    val applied = res["value"]?.jsonPrimitive?.contentOrNull ?: model
+                    DebugLog.log("RPC", "DashboardChat",
+                        "config.set model=$model → applied=$applied")
+                }
+                // v0.1.116: thinking on/off drives the effort level. "off" turns
+                // reasoning off; any real level turns it on. Empty reasoning while
+                // on falls back to the default (non-off) level.
+                val effort = if (thinkingOn) reasoning.ifBlank { DEFAULT_EFFORT } else "off"
+                rpcClient.configSet(sid, "reasoning", effort)
+                DebugLog.log("RPC", "DashboardChat",
+                    "config.set reasoning=$effort (thinkingOn=$thinkingOn)")
+                uiState = uiState.copy(
+                    currentModel = com.hermex.core.network.ModelPick.decode(model).model.ifBlank { uiState.currentModel },
+                    currentReasoning = effort.ifBlank { uiState.currentReasoning },
+                )
+                // The server emits session.info with the new model/reasoning; a
+                // lightweight resume also refreshes the gauge + chip immediately.
+                refreshUsageAndModel()
+            } catch (e: Exception) {
+                Log.e("Hermex", "applyModelToSession failed", e)
+                DebugLog.log("ERROR", "DashboardChat", "applyModelToSession failed: ${e.message}")
+                uiState = uiState.copy(error = e.message ?: "Model switch failed")
+            }
+        }
+    }
+
+    /** Lightweight resume to refresh context gauge + model chip (v0.1.91). */
+    private suspend fun refreshUsageAndModel() {
+        try {
+            val res = rpcClient.sessionResume(sessionId, omitMessages = true)
+            val ctx = parseContextUsage(res.info)
+            val m = res.info?.get("model")?.jsonPrimitive?.contentOrNull
+            val r = res.info?.get("reasoning_effort")?.jsonPrimitive?.contentOrNull
+            uiState = uiState.copy(
+                contextUsed = ctx.first ?: uiState.contextUsed,
+                contextMax = ctx.second ?: uiState.contextMax,
+                currentModel = m ?: uiState.currentModel,
+                currentReasoning = r?.takeIf { it.isNotBlank() } ?: uiState.currentReasoning,
+            )
+        } catch (_: Exception) { }
+    }
+
+    /** Read the profile's reasoning_effort (config.yaml) once, for the chip. */
+    fun loadReasoningFromConfig() {
+        viewModelScope.launch {
+            try {
+                val settingsRepo = SettingsRepository(getApplication())
+                val pick = settingsRepo.reasoningPick.first()
+                if (pick.isNotBlank()) {
+                    uiState = uiState.copy(currentReasoning = pick)
+                    return@launch
+                }
+                when (val r = DashboardApiClient.configRaw()) {
+                    is NetworkResult.Success -> {
+                        val yaml = r.data.yaml.orEmpty()
+                        val effort = Regex("""reasoning_effort:\s*["']?([a-z]+)""")
+                            .find(yaml)?.groupValues?.get(1)
+                        if (effort != null) {
+                            uiState = uiState.copy(currentReasoning = effort)
+                        }
+                    }
+                    else -> {}
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    // ── YOLO mode (v0.1.4) — session-scoped approval-skip toggle ──
+    // Mirrors the WebUI's cmdYolo: session-scoped, not persisted. The current state arrives with
+    // session.info, which any surface can update server-side.
+
+
+    /**
+     * Toggle YOLO mode on/off for this session.
+     *
+     * Optimistic: the button flips immediately so the user always gets feedback.
+     * YOLO is session-scoped and not persisted. The toggle is routed through the
+     * existing `/yolo` slash command (gateway slash infra) — no new dashboard
+     * route needed for the write. The slash output ("YOLO mode enabled/disabled")
+     * renders in chat as confirmation, and the button re-reads state on next open.
+     */
+    override fun setYolo(enabled: Boolean) {
+        if (sessionId.isEmpty()) return
+        // Flip immediately — the pill must respond the instant it's tapped.
+        uiState = uiState.copy(yoloEnabled = enabled)
+        sendMessage("/yolo")
+    }
+
+    /** Whether the chat screen is currently visible (background-turn tracking). */
+    private var screenVisible = true
+
+    /**
+     * v0.1.897 — the ONE foreground poll loop. Held so it can be cancelled instead of
+     * merely outlived.
+     *
+     * The Phase-0 claim that the loop ids were built to test is CONFIRMED by the
+     * 2026-10-20 field journal (v0.1.896, session 20261020_165748): every
+     * setScreenVisible(true) launched a new loop, and an old loop only died if it woke
+     * from its delay() while the flag was still false. Any hide→show inside the current
+     * delay (2 s burst / 30 s steady) resurrected the old loop, so each blip added a
+     * permanent extra loop: paired session.resume polls ~600 ms apart every 30 s for
+     * hours, and every reconcile rule ran once per loop (double full-history reloads).
+     * Cancelling the previous Job here makes "one loop per VM" structural.
+     */
+    private var pollLoopJob: Job? = null
+
+    override fun setScreenVisible(visible: Boolean) {
+        DebugLog.log("TRACE", "screenVisible", "${screenVisible}→$visible (sessionId=$sessionId)")
+        screenVisible = visible
+        // v0.1.874: publish the watched session so notification paths can skip
+        // "turn finished" pings for the very chat the user is looking at.
+        // Clear ONLY our own key: several chat VMs exist (one per open chat),
+        // and a hidden VM's onDispose(false) must not wipe the visible VM's key.
+        if (visible) {
+            com.hermex.v4.AppState.visibleSessionId = sessionId
+        } else if (com.hermex.v4.AppState.visibleSessionId == sessionId) {
+            com.hermex.v4.AppState.visibleSessionId = ""
+        }
+        // If the turn finished while away, the banner shows on re-entry
+        if (visible && uiState.completedWhileAway) {
+            DebugLog.log("RPC", "DashboardChat", "re-entered chat — completedWhileAway banner shown")
+        }
+        // Re-fetch live context on every chat open (v0.1.63): the one-time
+        // resume snapshot can miss real context after a server-side agent
+        // rebuild (e.g. auto-compression), and per-turn session.info events
+        // aren't guaranteed to reach this client (single-owner transport).
+        // A lightweight resume (messages omitted) gets us usage fresh.
+        // v0.1.69: keep retrying (burst then 5s poll) until the gauge has
+        // real data — the server always has it for a live session; a null
+        // reading is just a transient rebuild/compression window.
+        if (visible && sessionId.isNotEmpty()) {
+            // v0.1.897 — exactly one loop per VM. Cancel any previous loop BEFORE
+            // starting a new one; the old loop's `while (screenVisible)` test could
+            // never see the false from an intervening hide because we set the flag
+            // back to true here first (see the pollLoopJob doc).
+            val superseded = pollLoopJob
+            if (superseded != null && superseded.isActive) {
+                DebugLog.log("TRACE", "poll_loop",
+                    "cancelling superseded live loop before restart (sessionId=$sessionId)")
+            }
+            pollLoopJob?.cancel()
+            pollLoopJob = viewModelScope.launch {
+                var attempts = 0
+                // Phase 0 trace: every poll loop gets an id. The claim under test is that
+                // one loop is spawned per visible/hidden cycle and never dies — the ids
+                // make that countable in the log.
+                val loopId = pollLoopCounter.incrementAndGet()
+                DebugLog.log("TRACE", "poll_loop", "id=$loopId start sessionId=$sessionId")
+                // v0.1.87: poll CONTINUOUSLY while the chat is open — burst
+                // (2s) until first data, then every 30s to keep the gauge live.
+                // session.info events aren't guaranteed to reach this client
+                // (single-owner transport — the desktop usually owns the live
+                // stream), so without this the gauge freezes at the last
+                // reading or "—/—" forever. One lightweight resume per 30s is
+                // trivial while the screen is open.
+                while (screenVisible) {
+                    attempts++
+                    DebugLog.log("TRACE", "poll_tick", "id=$loopId attempt=$attempts screenVisible=$screenVisible")
+                    try {
+                        val result = rpcClient.sessionResume(sessionId, omitMessages = true)
+                        DebugLog.log("TRACE", "poll_resume",
+                            "id=$loopId ok running=${result.running} count=${result.message_count} " +
+                            "local=${uiState.messages.size} serverTurnWasRunning=$serverTurnWasRunning " +
+                            "localInFlight=${localInFlight()}")
+                        // v0.1.886 — foreground reconcile. The gateway routes each
+                        // session's event frames to the ONE transport stored on the
+                        // session; when the phone's socket drops mid-turn the server
+                        // sets a detached sentinel and every remaining frame is
+                        // DROPPED, not queued. The turn is still persisted, so the
+                        // client is left with a streaming message and/or an
+                        // unfinished tool card and no way to learn the turn ended.
+                        // This poll already carries `running` — if the server says
+                        // the turn is over and the local UI still thinks something
+                        // is in flight, do the full history reload. That is the
+                        // "close the app and reopen" path, now taken automatically
+                        // while the chat is open.
+                        // v0.1.887 — the reconcile decision lives in `Reconcile` so it
+                        // can be unit-tested without a phone (ReconcileTest). The three
+                        // cases are documented there.
+                        if (result.running == true && !serverTurnWasRunning) {
+                            serverTurnWasRunning = true
+                            DebugLog.log("STATE", "SessionID",
+                                "foreground poll: server running=true — watching for completion")
+                        }
+                        // FIX 5: `localTurnSubmitted` only counts while the final row is
+                        // still blank — the moment text lands it is cleared, so a flag from
+                        // a finished turn can never drive later reloads.
+                        val blankNow = Reconcile.blankFinalAssistantRow(uiState.messages)
+                        if (!blankNow) localTurnSubmitted = false
+                        val reconcileRule = Reconcile.ruleFor(uiState.messages, result.running,
+                            result.message_count, serverTurnWasRunning, turnDoneSeen,
+                            localTurnSubmitted && blankNow)
+                        val needsReload = reconcileRule != null
+                        // v0.1.893 — gate_poll now names every rule input, including the
+                        // two that trial D/14 showed were invisible: turnDoneSeen and
+                        // whether the final assistant row is blank. Without those the log
+                        // read "nothing to do" for a state that had lost the answer.
+                        DebugLog.log("TRACE", "gate_poll",
+                            "id=$loopId needsReload=$needsReload rule=${reconcileRule ?: "-"} " +
+                            "running=${result.running} " +
+                            "count=${result.message_count} local=${uiState.messages.size} " +
+                            "serverTurnWasRunning=$serverTurnWasRunning localInFlight=${localInFlight()} " +
+                            "turnDoneSeen=$turnDoneSeen localTurnSubmitted=$localTurnSubmitted " +
+                            "blankRowReloads=$blankRowReloadsForCurrentTurn " +
+                            "blankFinalRow=$blankNow")
+                        if (needsReload) {
+                            // v0.1.894 FIX 2 — the `break` that used to sit here ended the
+                            // whole `while (screenVisible)` loop. Measured across 37 journals:
+                            // 274 of 315 gate evaluations were a loop's FIRST and LAST tick,
+                            // 19 reached a second. So after any reconcile the gauge froze, the
+                            // model chip went stale, and rules A/B/D stopped being evaluated
+                            // for as long as the chat stayed open — a lost turn could only be
+                            // recovered by closing and reopening the chat.
+                            // Keeping the loop alive needs a bound on the expensive part
+                            // instead: at most one full-history reload per session per
+                            // [reconcileReloadMinIntervalMs]. Suppression is logged, never
+                            // silent, and the lightweight resume below still runs every tick.
+                            val nowMs = System.currentTimeMillis()
+                            val sinceLastMs = if (lastReconcileReloadAtMs == 0L) Long.MAX_VALUE
+                                else nowMs - lastReconcileReloadAtMs
+                            // "Reloaded and still blank" has to end somewhere. Rule D is
+                            // exempt from the cooldown because a blank final row is what the
+                            // user is looking at, so the bound here is on attempts per turn:
+                            // after that many full re-reads the answer is not in the history
+                            // we can read, and reloading again would run forever.
+                            val blankCapped = reconcileRule == "D" &&
+                                blankRowReloadsForCurrentTurn >= maxBlankRowReloadsPerTurn
+                            if (blankCapped) {
+                                DebugLog.log("TRACE", "gate_poll",
+                                    "id=$loopId rule=D reload STOPPED — $blankRowReloadsForCurrentTurn " +
+                                    "blank-row reloads already done for this turn and the final row is " +
+                                    "still blank; the answer is not in the server history we can read " +
+                                    "(local=${uiState.messages.size} count=${result.message_count})")
+                            } else if (sinceLastMs < reconcileReloadMinIntervalMs && reconcileRule != "D") {
+                                // Rule D is never rate limited. A blank final row is the one
+                                // state where the user is actively looking at a prompt with no
+                                // answer; holding it for the cooldown turns a recoverable bug
+                                // into a visible 30 s failure. The cooldown exists to stop a
+                                // level-triggered A/B reload from hammering history reads, not
+                                // to gate the recovery the user can see.
+                                DebugLog.log("TRACE", "gate_poll",
+                                    "id=$loopId rule=${reconcileRule ?: "-"} reload SUPPRESSED — last " +
+                                    "full reload was ${sinceLastMs}ms ago " +
+                                    "(< ${reconcileReloadMinIntervalMs}ms), needsReload still true; " +
+                                    "polling continues")
+                            } else {
+                                if (reconcileRule == "D") {
+                                    blankRowReloadsForCurrentTurn++
+                                    DebugLog.log("TRACE", "gate_poll",
+                                        "id=$loopId rule=D blank-row reload attempt " +
+                                        "$blankRowReloadsForCurrentTurn/$maxBlankRowReloadsPerTurn")
+                                }
+                                lastReconcileReloadAtMs = nowMs
+                                serverTurnWasRunning = false
+                                DebugLog.log("STATE", "SessionID",
+                                    "foreground poll: reconcile — server running=${result.running} " +
+                                    "count=${result.message_count} local=${uiState.messages.size} " +
+                                    "— full reload (loop continues; next reload allowed after " +
+                                    "${reconcileReloadMinIntervalMs}ms)")
+                                loadMessages()
+                            }
+                        }
+                        val ctx = parseContextUsage(result.info)
+                        if (ctx.first != null || ctx.second != null) {
+                            uiState = uiState.copy(
+                                contextUsed = ctx.first ?: uiState.contextUsed,
+                                contextMax = ctx.second ?: uiState.contextMax,
+                            )
+                        }
+                        // v0.1.88: keep the model chip fresh on every poll
+                        val m = result.info?.get("model")?.jsonPrimitive?.contentOrNull
+                        val r = result.info?.get("reasoning_effort")?.jsonPrimitive?.contentOrNull
+                        if ((!m.isNullOrBlank() && m != uiState.currentModel) ||
+                            (!r.isNullOrBlank() && r != uiState.currentReasoning)) {
+                            uiState = uiState.copy(
+                                currentModel = m ?: uiState.currentModel,
+                                currentReasoning = r?.takeIf { it.isNotBlank() }
+                                    ?: uiState.currentReasoning,
+                            )
+                        }
+                    } catch (e: Exception) {
+                        // Phase 0: this silent catch swallowed every failed resume on the
+                        // recovery path of the headline bug. Log it; behaviour unchanged.
+                        DebugLog.log("TRACE", "poll_resume",
+                            "id=$loopId FAILED ${e.javaClass.simpleName}: ${e.message}")
+                    }
+                    delay(if (attempts <= 3) 2_000 else 30_000)
+                }
+                DebugLog.log("TRACE", "poll_loop",
+                    "id=$loopId ended (screenVisible=false) sessionId=$sessionId")
+            }
+        } else if (!visible) {
+            // v0.1.897 — stop polling the moment the screen hides instead of waiting
+            // for the next tick's flag check; also closes the resurrection window.
+            pollLoopJob?.cancel()
+            pollLoopJob = null
+        }
+    }
+
+    override fun clearCompletedWhileAway() {
+        if (uiState.completedWhileAway) {
+            uiState = uiState.copy(completedWhileAway = false)
+        }
+    }
+
+    /**
+     * Called when a turn finishes (message.completed / run.completed). If the
+     * chat screen wasn't visible at that moment, flag it for the re-entry banner.
+     */
+    private fun onTurnFinished() {
+        if (!screenVisible && uiState.isStreaming) {
+            DebugLog.log("RPC", "DashboardChat", "turn finished while screen away — flagging banner")
+            uiState = uiState.copy(completedWhileAway = true)
+        }
+    }
+
+    companion object {
+        /**
+         * Extract live context-window occupancy from a session.info JSON payload.
+         * The server's session.info carries `usage: {context_used, context_max, ...}`
+         * (current window occupancy, NOT cumulative lifetime tokens). Returns
+         * (used, max); either side may be null when the server hasn't reported it.
+         */
+        private fun parseContextUsage(info: JsonObject?): Pair<Long?, Long?> {
+            if (info == null) return null to null
+            return try {
+                val usage = info["usage"]?.jsonObject ?: return null to null
+                val used = usage["context_used"]?.jsonPrimitive?.longOrNull
+                val max = usage["context_max"]?.jsonPrimitive?.longOrNull
+                used to max
+            } catch (_: Exception) {
+                null to null
+            }
+        }
+
+        /** Parse `{"todos": [{id, content, status}, ...]}` from a tool.complete result. */
+        private fun parseTodos(element: JsonElement?): List<UiTodo>? {
+            if (element == null) return null
+            return try {
+                val arr = element.jsonObject["todos"]?.jsonArray ?: return null
+                val todos = arr.mapNotNull { item ->
+                    val obj = item.jsonObject
+                    val id = obj["id"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                    UiTodo(
+                        id = id,
+                        content = obj["content"]?.jsonPrimitive?.contentOrNull ?: "",
+                        status = obj["status"]?.jsonPrimitive?.contentOrNull ?: "pending",
+                    )
+                }
+                todos.ifEmpty { null }
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        /** Parse todos from a raw JSON string (tool message `context` in history). */
+        private fun parseTodosFromString(raw: String?): List<UiTodo>? {
+            if (raw.isNullOrBlank()) return null
+            return try {
+                parseTodos(Json.parseToJsonElement(raw))
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+}
